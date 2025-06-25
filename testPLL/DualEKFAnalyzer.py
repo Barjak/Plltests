@@ -319,8 +319,8 @@ class DualEKFAnalyzer:
         ax1 = fig.add_subplot(gs[0:2, 0:2])
         
         # Compute and plot error landscape
-        f1_range = (f1_true - 0.015, f1_true + 0.015)
-        f2_range = (f2_true - 0.015, f2_true + 0.015)
+        f1_range = (f1_true - 0.15, f1_true + 0.15)
+        f2_range = (f2_true - 0.15, f2_true + 0.15)
         f1_grid, f2_grid, error_landscape = self.compute_error_landscape(
             signal_data, f1_range, f2_range, f1_true, f2_true
         )
