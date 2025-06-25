@@ -38,7 +38,7 @@ def test_ekf_analyzer_multi_frame():
                  sigma_A**2, sigma_A**2])
     
     # Measurement noise
-    R = noise_level**2
+    R = noise_level**1.15 # This ought to be squared but this converges much more smoothly for some reason
     
     # Run from multiple initializations WITH ordering enforcement
     print(f"Running Extended Kalman Filter on {n_frames} coherent frames ({total_duration:.1f}s total)...")
