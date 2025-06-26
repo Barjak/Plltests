@@ -7,7 +7,7 @@ def test_ekf_analyzer_multi_frame():
     # Generate test signal with MULTIPLE COHERENT FRAMES
     fs_baseband = 960.0
     frame_duration = 0.3  # seconds per frame
-    n_frames = 10  # Number of frames
+    n_frames = 25  # Number of frames
     total_duration = frame_duration * n_frames
     n_samples = int(fs_baseband * total_duration)
     t = np.arange(n_samples) / fs_baseband
@@ -32,13 +32,13 @@ def test_ekf_analyzer_multi_frame():
     # Process noise (per sample)
     sigma_phi = 1e-7      # Very small phase noise
     sigma_w = 1e-5        # Frequency drift (rad/s)
-    sigma_A = 1e-4        # Amplitude drift
+    sigma_A = 1e-5        # Amplitude drift
     Q = np.diag([sigma_phi**2, sigma_w**2, 
                  sigma_phi**2, sigma_w**2,
                  sigma_A**2, sigma_A**2])
     
     # Measurement noise
-    R = noise_level**1.15 # This ought to be squared but this converges much more smoothly for some reason
+    R = 4.0
     
     # Run from multiple initializations WITH ordering enforcement
     print(f"Running Extended Kalman Filter on {n_frames} coherent frames ({total_duration:.1f}s total)...")

@@ -51,16 +51,16 @@ class DualEKFAnalyzer:
         
         # Process noise covariance
         if Q is None:
-            sigma_phi = 1e-6      # Phase noise (very small)
-            sigma_w = 1e-3        # Frequency drift
-            sigma_A = 1e-4        # Amplitude drift
+            sigma_phi = 1e-7      # Phase noise (very small)
+            sigma_w = 1e-4        # Frequency drift
+            sigma_A = 1e-6        # Amplitude drift
             Q = np.diag([sigma_phi**2, sigma_w**2, 
                          sigma_phi**2, sigma_w**2,
                          sigma_A**2, sigma_A**2])
         
         # Measurement noise covariance
         if R is None:
-            R = 0.01**2  # Based on noise level in signal
+            R = 3.0
         
         # Initial state covariance
         if P0 is None:
@@ -258,6 +258,227 @@ class DualEKFAnalyzer:
             'history': history,
             'total_swaps': np.sum(history['swaps'])
         }
+        
+    def dual_pll_with_tracking(self, signal_data, f1_init, f2_init, 
+                              Q=None, R=None, P0=None,
+                              track_amplitude=True,
+                              min_separation_hz=0.003,  # 3 mHz minimum
+                              separation_weight=0.004,
+                              enforce_ordering=True):  # New parameter
+        """
+        Dual PLL with detailed tracking of all parameters
+        Backwards compatible with dual_ekf_tracking signature
+        
+        Parameters match EKF method for compatibility:
+        - Q, R, P0: Not used in PLL but accepted for compatibility
+        - min_separation_hz: Minimum frequency separation in Hz
+        - separation_weight: Maps to frequency regularization strength
+        - enforce_ordering: If True, enforces f1 < f2 constraint
+        """
+        n_samples = len(signal_data)
+        
+        # Ensure initial ordering if enforce_ordering is True
+        if enforce_ordering and f1_init > f2_init:
+            f1_init, f2_init = f2_init, f1_init
+        
+        # Initialize
+        phase1, phase2 = 0.0, 0.0
+        freq1, freq2 = f1_init, f2_init
+        
+        # Amplitude tracking
+        if track_amplitude:
+            A1, A2 = 1.0, 0.7  # Initial guess matching EKF
+        else:
+            A1, A2 = 1.0, 0.7  # Fixed
+        
+        # PLL parameters
+        loop_bw = 0.5  # Hz
+        damping = 1.0
+        theta = 2 * np.pi * loop_bw / self.fs
+        d = 1 + 2 * damping * theta + theta**2
+        g1 = 4 * damping * theta / d
+        g2 = 4 * theta**2 / d
+        
+        # Map EKF parameters to PLL equivalents
+        min_separation = min_separation_hz  # Use same name convention
+        freq_regularization = separation_weight * 25  # Scale factor for similar behavior
+        amplitude_regularization = 0.1
+        
+        # Storage for analysis - match EKF history structure
+        history = {
+            'x': [],  # Will store state vector for compatibility
+            'P': [],  # Dummy for compatibility
+            'y_pred': [],
+            'innov': [],
+            'freq1': [freq1],
+            'freq2': [freq2],
+            'A1': [A1],
+            'A2': [A2],
+            'phase1': [phase1],
+            'phase2': [phase2],
+            'separation': [abs(freq2 - freq1)],
+            'error': [],
+            'K': [],  # Dummy for compatibility
+            'swaps': []  # Track when swaps occur
+        }
+        
+        # Additional PLL-specific tracking
+        history['phase_error1'] = []
+        history['phase_error2'] = []
+        history['reg_force'] = []
+        
+        # Loop filter integrals
+        phase_error1_integral = 0
+        phase_error2_integral = 0
+        
+        # Store initial state vector for compatibility
+        x = np.array([phase1, 2*np.pi*freq1, phase2, 2*np.pi*freq2, A1, A2])
+        history['x'].append(x.copy())
+        history['P'].append(np.eye(6))  # Dummy
+        history['K'].append(np.zeros((6, 2)))  # Dummy
+        
+        for i, sample in enumerate(signal_data):
+            # Generate NCOs
+            nco1 = np.exp(1j * phase1)
+            nco2 = np.exp(1j * phase2)
+            
+            # Current signal estimate
+            if track_amplitude:
+                signal_est = A1 * nco1 + A2 * nco2
+            else:
+                # Simple correlation for fixed amplitudes
+                a1 = sample * np.conj(nco1)
+                a2 = sample * np.conj(nco2)
+                signal_est = a1 * nco1 + a2 * nco2
+                # Use correlation magnitudes as effective amplitudes
+                A1_eff = np.abs(a1)
+                A2_eff = np.abs(a2)
+            
+            # Store prediction for EKF compatibility
+            history['y_pred'].append(signal_est)
+            
+            # Innovation (error)
+            error = sample - signal_est
+            innov = np.array([np.real(error), np.imag(error)])
+            history['innov'].append(innov)
+            history['error'].append(np.abs(error))
+            
+            # Phase errors
+            if track_amplitude:
+                phase_error1 = np.real(np.conj(error) * 1j * A1 * nco1)
+                phase_error2 = np.real(np.conj(error) * 1j * A2 * nco2)
+            else:
+                phase_error1 = np.real(np.conj(error) * 1j * A1_eff * nco1)
+                phase_error2 = np.real(np.conj(error) * 1j * A2_eff * nco2)
+            
+            history['phase_error1'].append(phase_error1)
+            history['phase_error2'].append(phase_error2)
+            
+            # Regularization force for minimum separation
+            separation = abs(freq2 - freq1)
+            reg_force = 0
+            if separation < min_separation:
+                reg_force = freq_regularization * (min_separation - separation) / min_separation
+                if enforce_ordering:
+                    # Always push f1 down and f2 up to maintain ordering
+                    phase_error1 -= reg_force
+                    phase_error2 += reg_force
+                else:
+                    # Original symmetric push
+                    if freq2 > freq1:
+                        phase_error2 += reg_force
+                        phase_error1 -= reg_force
+                    else:
+                        phase_error2 -= reg_force
+                        phase_error1 += reg_force
+            
+            history['reg_force'].append(reg_force)
+            
+            # Update frequencies with loop filter
+            phase_error1_integral += phase_error1
+            phase_error2_integral += phase_error2
+            
+            freq1_new = f1_init + g1 * phase_error1 + g2 * phase_error1_integral
+            freq2_new = f2_init + g1 * phase_error2 + g2 * phase_error2_integral
+            
+            # Check for ordering violation and handle swaps
+            swap_occurred = False
+            if enforce_ordering and freq1_new > freq2_new:
+                # Swap frequencies
+                freq1_new, freq2_new = freq2_new, freq1_new
+                # Swap phases
+                phase1, phase2 = phase2, phase1
+                # Swap amplitudes
+                if track_amplitude:
+                    A1, A2 = A2, A1
+                # Swap integral states
+                phase_error1_integral, phase_error2_integral = phase_error2_integral, phase_error1_integral
+                swap_occurred = True
+            
+            freq1, freq2 = freq1_new, freq2_new
+            history['swaps'].append(swap_occurred)
+            
+            # Update phases
+            phase1 += 2 * np.pi * freq1 / self.fs
+            phase2 += 2 * np.pi * freq2 / self.fs
+            phase1 = np.angle(np.exp(1j * phase1))
+            phase2 = np.angle(np.exp(1j * phase2))
+            
+            # Update amplitudes if tracking
+            if track_amplitude:
+                # Gradient descent on amplitudes with regularization
+                learning_rate = 0.01
+                
+                dA1 = -2 * np.real(np.conj(error) * nco1)
+                dA2 = -2 * np.real(np.conj(error) * nco2)
+                
+                # Add regularization gradient
+                dA1 += amplitude_regularization * (A1 - 1.0)
+                dA2 += amplitude_regularization * (A2 - 1.0)
+                
+                A1 -= learning_rate * dA1
+                A2 -= learning_rate * dA2
+                
+                # Constrain to positive
+                A1 = max(0.1, A1)
+                A2 = max(0.1, A2)
+            
+            # Store history
+            history['freq1'].append(freq1)
+            history['freq2'].append(freq2)
+            history['A1'].append(A1)
+            history['A2'].append(A2)
+            history['phase1'].append(phase1)
+            history['phase2'].append(phase2)
+            history['separation'].append(abs(freq2 - freq1))
+            
+            # Store state vector for EKF compatibility
+            x = np.array([phase1, 2*np.pi*freq1, phase2, 2*np.pi*freq2, A1, A2])
+            history['x'].append(x.copy())
+            history['P'].append(np.eye(6))  # Dummy
+            history['K'].append(np.zeros((6, 2)))  # Dummy
+        
+        # Convert lists to arrays (except x, P, K as per EKF)
+        for key in history:
+            if key not in ['x', 'P', 'K']:
+                history[key] = np.array(history[key])
+        
+        # Compute final estimates (average over last quarter of samples)
+        converged_f1 = np.mean(history['freq1'][-n_samples//4:])
+        converged_f2 = np.mean(history['freq2'][-n_samples//4:])
+        converged_A1 = np.mean(history['A1'][-n_samples//4:])
+        converged_A2 = np.mean(history['A2'][-n_samples//4:])
+        
+        # Return structure matching EKF output exactly
+        return {
+            'f1': converged_f1,
+            'f2': converged_f2,
+            'beat': converged_f2 - converged_f1,
+            'A1': converged_A1,
+            'A2': converged_A2,
+            'history': history,
+            'total_swaps': np.sum(history['swaps'])
+        }
     
     def run_from_multiple_initializations(self, signal_data, f1_true, f2_true, 
                                     Q=None, R=None, enforce_ordering=True):
@@ -273,7 +494,7 @@ class DualEKFAnalyzer:
             (f1_true, f1_true + 0.020, "Far apart"),
             (f1_true - 0.005, f2_true + 0.005, "Symmetric offset"),
             (f1_true + 0.002, f2_true - 0.002, "Inward offset"),
-            (5.5, 5.7, "Random far"),
+#             (5.5, 5.7, "Random far"),
         ]
         
         results = []
@@ -319,8 +540,8 @@ class DualEKFAnalyzer:
         ax1 = fig.add_subplot(gs[0:2, 0:2])
         
         # Compute and plot error landscape
-        f1_range = (f1_true - 0.15, f1_true + 0.15)
-        f2_range = (f2_true - 0.15, f2_true + 0.15)
+        f1_range = (f1_true - 0.015, f1_true + 0.015)
+        f2_range = (f2_true - 0.015, f2_true + 0.015)
         f1_grid, f2_grid, error_landscape = self.compute_error_landscape(
             signal_data, f1_range, f2_range, f1_true, f2_true
         )
