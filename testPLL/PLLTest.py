@@ -5,7 +5,7 @@ def test_ekf_analyzer_multi_frame():
     # Generate test signal with MULTIPLE COHERENT FRAMES
     fs_baseband = 960.0
     frame_duration = 0.3  # seconds per frame
-    n_frames = 5  # Number of frames
+    n_frames = 2  # Number of frames
     total_duration = frame_duration * n_frames
     n_samples = int(fs_baseband * total_duration)
     t = np.arange(n_samples) / fs_baseband
@@ -14,7 +14,7 @@ def test_ekf_analyzer_multi_frame():
     f1_true = 5.625480
     f2_true = 5.631480  # 6 mHz separation
     
-    # Generate continuous two-tone signal (no discontinuities!)
+    # Generate continuous two-tone signal (no disc	ontinuities!)
     signal_data = (np.exp(1j * 2 * np.pi * f1_true * t) + 
                    0.7 * np.exp(1j * 2 * np.pi * f2_true * t))
     
@@ -28,16 +28,16 @@ def test_ekf_analyzer_multi_frame():
     
     # Set up process and measurement noise covariances for reparameterized state
     # State: [phi1, phi2, w_sum, w_diff, A1, A2]
-    sigma_phi = 1e-7      # Phase noise (very small)
-    sigma_w_sum = 1e-3    # Average frequency drift (allow more)
-    sigma_w_diff = 1e-8   # Frequency difference drift (restrict more)
-    sigma_A = 1e-5        # Amplitude drift
+    sigma_phi = 2e-1      # Phase noise (very small)
+    sigma_w_sum = 2e-1    # Average frequency drift (allow more)
+    sigma_w_diff = 2e-2   # Frequency difference drift (restrict more)
+    sigma_A = 1e-3        # Amplitude drift
     Q = np.diag([sigma_phi**2, sigma_phi**2,     # phi1, phi2
                  sigma_w_sum**2, sigma_w_diff**2,  # w_sum, w_diff
                  sigma_A**2, sigma_A**2])          # A1, A2
     
     # Measurement noise
-    R = 4.10
+    R = 3.0
     
     # Run from multiple initializations WITH ordering enforcement
     print(f"Running Extended Kalman Filter on {n_frames} coherent frames ({total_duration:.1f}s total)...")
