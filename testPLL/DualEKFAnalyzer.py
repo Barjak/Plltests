@@ -285,7 +285,7 @@ class DualEKFAnalyzer:
             (f1_true, f1_true + 0.020, "Far apart"),
             (f1_true - 0.005, f2_true + 0.005, "Symmetric offset"),
             (f1_true + 0.002, f2_true - 0.002, "Inward offset"),
-#             (5.5, 5.7, "Random far"),
+            (5.5, 5.7, "Random far"),
         ]
         
         results = []
