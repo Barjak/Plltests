@@ -16,15 +16,10 @@ class DualEKFAnalyzer:
                           track_amplitude=True,
                           min_separation_hz=0.006,  # 6 mHz minimum
                           separation_buffer_hz=0.001,  # 1 mHz buffer above minimum
-                          acceleration_scale=200.0,  # Scale factor for fast movement when far
-                          transition_zone_hz=0.004,  # 4 mHz transition zone
-                          damping_factor=3.0,  # Exponential damping strength
-                          barrier_decay=4.5,  # Exponential decay for soft barrier
-                          barrier_strength=10.0,  # Exponential strength for measurement weight
-                          base_separation_weight=0.004):  # Keep for compatibility, ignored
+                          separation_weight=0.01):  # Weight for pseudo-measurement
         """
-        Dual-tone tracking using Extended Kalman Filter with direct frequency parameterization,
-        acceleration far from minimum separation, and exponential damping near it
+        Dual-tone tracking using Extended Kalman Filter with direct frequency parameterization
+        and minimum separation enforcement
         
         State vector: x = [phi1, phi2, f1, f2, A1, A2]
         where:
@@ -53,19 +48,16 @@ class DualEKFAnalyzer:
                       f1_init,   # f1
                       f2_init,   # f2
                       1.0,       # A1
-                      0.7])      # A2
+                      1.0])      # A2
         
-        # Base process noise covariance
+        # Process noise covariance
         if Q is None:
             sigma_phi = 1e-7      # Phase noise (very small)
-            sigma_f_base = 1e-4   # Base frequency drift
+            sigma_f = 1e-4        # Frequency drift
             sigma_A = 1e-6        # Amplitude drift
-            Q_base = np.diag([sigma_phi**2, sigma_phi**2, 
-                             sigma_f_base**2, sigma_f_base**2,
-                             sigma_A**2, sigma_A**2])
-        else:
-            Q_base = Q.copy()
-            sigma_f_base = np.sqrt(Q_base[2, 2])
+            Q = np.diag([sigma_phi**2, sigma_phi**2, 
+                        sigma_f**2, sigma_f**2,
+                        sigma_A**2, sigma_A**2])
         
         # Initial state covariance
         if P0 is None:
@@ -98,38 +90,11 @@ class DualEKFAnalyzer:
             'error': [],
             'K': [],
             'swaps': [],
-            'adaptive_Q': [],  # Track adaptive process noise
-            'pseudo_weight': []  # Track adaptive measurement weight
+            'pseudo_applied': []  # Track when pseudo-measurement is applied
         }
         
         # Main EKF loop
         for k, y in enumerate(signal_data):
-            # ---- Adaptive Process Noise ----
-            Q = Q_base.copy()
-            
-            # Current separation
-            separation = x[3] - x[2]
-            
-            if separation > min_separation_hz + transition_zone_hz:
-                # Far from barrier: scale UP process noise to allow fast movement
-                Q[2, 2] = Q_base[2, 2] * acceleration_scale
-                Q[3, 3] = Q_base[3, 3] * acceleration_scale
-            else:
-                # Near barrier: exponential velocity damping
-                # Distance from minimum (normalized by buffer size)
-                distance_from_min = max(0, separation - min_separation_hz)
-                relative_distance = distance_from_min / separation_buffer_hz
-                
-                # Exponential damping: approaches 0 as we get close to minimum
-                damping = np.exp(-damping_factor * (1 / (relative_distance + 0.1)))
-                
-                # Apply stronger damping to the frequency that would reduce separation
-                # For f1: damping upward movement, for f2: damping downward movement
-                Q[2, 2] = Q_base[2, 2] * damping  # f1: reduce upward drift
-                Q[3, 3] = Q_base[3, 3] * damping  # f2: reduce downward drift
-            
-            history['adaptive_Q'].append([np.sqrt(Q[2, 2]), np.sqrt(Q[3, 3])])
-            
             # ---- Predict ----
             x = F @ x
             P = F @ P @ F.T + Q
@@ -180,28 +145,13 @@ class DualEKFAnalyzer:
             x = x + K @ innov
             P = (np.eye(6) - K @ H) @ P
             
-            # ---- Soft barrier pseudo-measurement for minimum separation ----
+            # ---- Pseudo-measurement for minimum separation ----
             current_sep = x[3] - x[2]
             
-            # Only apply if getting close to or below minimum
-            if current_sep < min_separation_hz + 3 * separation_buffer_hz:
-                # Target separation with soft exponential barrier
-                if current_sep >= min_separation_hz:
-                    # Above minimum: create soft repulsion
-                    target_sep = min_separation_hz + separation_buffer_hz * (1 - np.exp(-barrier_decay * (current_sep - min_separation_hz) / separation_buffer_hz))
-                else:
-                    # Below minimum: strong push back
-                    target_sep = min_separation_hz + separation_buffer_hz
-                
-                # Adaptive measurement weight (exponentially stronger as we approach boundary)
-                if current_sep < min_separation_hz:
-                    # Very strong weight if below minimum
-                    weight = base_separation_weight * 100
-                else:
-                    relative_closeness = max(0, (min_separation_hz + separation_buffer_hz - current_sep) / separation_buffer_hz)
-                    weight = base_separation_weight * np.exp(barrier_strength * relative_closeness)
-                
-                history['pseudo_weight'].append(weight)
+            # Apply pseudo-measurement if below or close to minimum
+            if current_sep < min_separation_hz + separation_buffer_hz:
+                # Target separation
+                target_sep = min_separation_hz + separation_buffer_hz
                 
                 # Pseudo-measurement update on the separation f2 - f1
                 # H_pseudo = [0, 0, -1, 1, 0, 0] to observe f2 - f1
@@ -212,7 +162,7 @@ class DualEKFAnalyzer:
                 z_pseudo = np.array([target_sep])
                 z_hat_pseudo = np.array([current_sep])
                 
-                R_pseudo = 1.0 / weight
+                R_pseudo = 1.0 / separation_weight
                 
                 S_pseudo = H_pseudo @ P @ H_pseudo.T + R_pseudo
                 K_pseudo = P @ H_pseudo.T / S_pseudo
@@ -220,13 +170,18 @@ class DualEKFAnalyzer:
                 x = x + K_pseudo.flatten() * (z_pseudo - z_hat_pseudo)
                 P = (np.eye(6) - np.outer(K_pseudo, H_pseudo)) @ P
                 
-                # Ensure ordering is maintained (f1 < f2)
-                if x[2] > x[3]:
-                    x[2], x[3] = x[3], x[2]
-                    x[0], x[1] = x[1], x[0]
-                    x[4], x[5] = x[5], x[4]
+                history['pseudo_applied'].append(True)
             else:
-                history['pseudo_weight'].append(0.0)
+                history['pseudo_applied'].append(False)
+            
+            # Ensure ordering is maintained (f1 < f2)
+            if x[2] > x[3]:
+                x[2], x[3] = x[3], x[2]
+                x[0], x[1] = x[1], x[0]
+                x[4], x[5] = x[5], x[4]
+                history['swaps'].append(True)
+            else:
+                history['swaps'].append(False)
             
             # Ensure positive amplitudes
             if track_amplitude:
@@ -247,7 +202,6 @@ class DualEKFAnalyzer:
             history['separation'].append(x[3] - x[2])
             history['error'].append(np.abs(y - y_hat))
             history['K'].append(K.copy())
-            history['swaps'].append(False)
         
         # Convert lists to arrays
         for key in history:
@@ -267,265 +221,6 @@ class DualEKFAnalyzer:
             'A1': converged_A1,
             'A2': converged_A2,
             'history': history,
-            'total_swaps': 0
+            'total_swaps': np.sum(history['swaps'])
         }
         
-    def run_from_multiple_initializations(self, signal_data, f1_true, f2_true, 
-                                    Q=None, R=None, enforce_ordering=True):
-        """Test EKF from various starting points"""
-        
-        # Define test cases
-        test_cases = [
-            # (f1_init, f2_init, label)
-            (f1_true, f2_true, "Truth"),
-            (f1_true - 0.010, f2_true + 0.010, "Far from truth"),
-            (f2_true, f1_true, "Swapped"),
-            (f1_true, f1_true + 0.001, "Very close"),
-            (f1_true, f1_true + 0.020, "Far apart"),
-            (f1_true - 0.005, f2_true + 0.005, "Symmetric offset"),
-            (f1_true + 0.002, f2_true - 0.002, "Inward offset"),
-#             (6.5, 6.7, "Random far"),
-        ]
-        
-        results = []
-        for f1_init, f2_init, label in test_cases:
-            result = self.dual_ekf_tracking(signal_data, f1_init, f2_init, Q=Q, R=R)
-            result['label'] = label
-            result['f1_init'] = f1_init
-            result['f2_init'] = f2_init
-            results.append(result)
-        
-        return results
-    
-    def compute_error_landscape(self, signal_data, f1_range, f2_range, true_f1, true_f2):
-        """Compute the error landscape for visualization"""
-        n_points = 100
-        f1_grid = np.linspace(f1_range[0], f1_range[1], n_points)
-        f2_grid = np.linspace(f2_range[0], f2_range[1], n_points)
-        
-        error_landscape = np.zeros((n_points, n_points))
-        
-        # Pre-compute true signal for efficiency
-        t = np.arange(len(signal_data)) / self.fs
-        
-        for i, f1 in enumerate(f1_grid):
-            for j, f2 in enumerate(f2_grid):
-                # Skip if f2 < f1 (invalid ordering)
-                if f2 < f1:
-                    error_landscape[j, i] = np.nan
-                    continue
-                
-                # Convert to sum/diff for internal clarity
-                f_sum = (f1 + f2) / 2
-                f_diff = (f2 - f1) / 2
-                
-                # Convert back (just to show the parameterization is consistent)
-                f1_check = f_sum - f_diff
-                f2_check = f_sum + f_diff
-                
-                assert np.abs(f1_check - f1) < 1e-10
-                assert np.abs(f2_check - f2) < 1e-10
-                
-                # Compute error for this (f1, f2) pair
-                s1 = np.exp(1j * 2 * np.pi * f1 * t)
-                s2 = 0.7 * np.exp(1j * 2 * np.pi * f2 * t)
-                estimate = s1 + s2
-                
-                error = np.mean(np.abs(signal_data - estimate)**2)
-                error_landscape[j, i] = error  # Note: j, i for proper orientation
-        
-        return f1_grid, f2_grid, error_landscape
-    def visualize_ekf_analysis(self, results, signal_data, f1_true, f2_true):
-        """Comprehensive visualization of EKF behavior with reparameterized state"""
-        
-        fig = plt.figure(figsize=(20, 12))
-        gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.4, wspace=0.3, 
-                              width_ratios=[2, 1, 1])
-        
-        # 1. 2D Phase Space Trajectories (large, left side)
-        ax1 = fig.add_subplot(gs[:, 0])
-        
-        # Compute and plot error landscape
-        f1_range = (f1_true - 0.015, f1_true + 0.015)
-        f2_range = (f2_true - 0.015, f2_true + 0.015)
-#         f1_range = (5.6, 6.8)# 
-#         f2_range = (5.6, 6.8)
-        f1_grid, f2_grid, error_landscape = self.compute_error_landscape(
-            signal_data, f1_range, f2_range, f1_true, f2_true
-        )
-        
-        # Plot error landscape with more contour lines
-        contour = ax1.contourf(f1_grid, f2_grid, np.log10(error_landscape + 1e-10), 
-                               levels=50, cmap='viridis', alpha=0.6)
-        
-        # Plot trajectories
-        colors = cm.rainbow(np.linspace(0, 1, len(results)))
-        for result, color in zip(results, colors):
-            history = result['history']
-            ax1.plot(history['freq1'], history['freq2'], '-', color=color, 
-                    linewidth=1.5, alpha=0.8, label=result['label'])
-            # Start point
-            ax1.plot(result['f1_init'], result['f2_init'], 'o', 
-                    color=color, markersize=12, markeredgecolor='black', 
-                    markeredgewidth=1.5)
-            # End point
-            ax1.plot(history['freq1'][-1], history['freq2'][-1], 's', 
-                    color=color, markersize=12, markeredgecolor='black',
-                    markeredgewidth=1.5)
-        
-        # True values
-        ax1.plot(f1_true, f2_true, '*', color='red', markersize=25, 
-                markeredgecolor='black', markeredgewidth=2, label='True')
-        
-        # Diagonal line (f1 = f2)
-        diag_line = np.array([min(f1_range[0], f2_range[0]), 
-                             max(f1_range[1], f2_range[1])])
-        ax1.plot(diag_line, diag_line, 'k--', alpha=0.5, linewidth=2, label='f1=f2')
-        
-        # Add minimum separation line (3 mHz below diagonal)
-        min_sep_hz = 0.003
-        ax1.plot(diag_line, diag_line + min_sep_hz, 'k:', alpha=0.5, linewidth=1.5, 
-                label=f'min sep ({min_sep_hz*1000:.0f} mHz)')
-        
-        ax1.set_xlabel('f1 (Hz)', fontsize=12)
-        ax1.set_ylabel('f2 (Hz)', fontsize=12)
-        ax1.set_title('2D Frequency Space Trajectories (Reparameterized EKF)', fontsize=14)
-        ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=10)
-        ax1.grid(True, alpha=0.3)
-        ax1.set_aspect('equal')
-        
-        # Add colorbar for error landscape
-        cbar = plt.colorbar(contour, ax=ax1, fraction=0.046, pad=0.04)
-        cbar.set_label('log10(MSE)', fontsize=10)
-        
-        # 2. Separation Evolution (top right)
-        ax2 = fig.add_subplot(gs[0, 1:])
-        
-        for result, color in zip(results, colors):
-            history = result['history']
-            samples = np.arange(len(history['separation']))
-            ax2.plot(samples, history['separation'] * 1000, '-', color=color, 
-                    linewidth=2, alpha=0.8)
-        
-        ax2.axhline(6.0, color='red', linestyle='--', linewidth=2, label='True separation')
-        ax2.axhline(3.0, color='black', linestyle=':', linewidth=1.5, label='Min separation')
-        ax2.set_xlabel('Sample')
-        ax2.set_ylabel('|f2 - f1| (mHz)')
-        ax2.set_title('Frequency Separation Evolution')
-        ax2.grid(True, alpha=0.3)
-        ax2.set_ylim([0, max(20, ax2.get_ylim()[1])])
-        ax2.legend()
-        
-        # 3. Uncertainty Evolution (second from top right)
-        ax3 = fig.add_subplot(gs[1, 1:])
-        
-        # Plot frequency uncertainty for the "Truth" case
-        truth_result = results[0]
-        P_history = truth_result['history']['P']
-        
-        # Extract standard deviations for frequencies from reparameterized state
-        # State: [phi1, phi2, w_sum, w_diff, A1, A2]
-        # w1 = w_sum - w_diff, w2 = w_sum + w_diff
-        std_w_sum = []
-        std_w_diff = []
-        std_f1 = []
-        std_f2 = []
-        
-        for P in P_history:
-            # Extract variances
-            var_w_sum = P[2, 2]
-            var_w_diff = P[3, 3]
-            cov_sum_diff = P[2, 3]
-            
-            # Compute frequency variances using error propagation
-            # var(w1) = var(w_sum - w_diff) = var(w_sum) + var(w_diff) - 2*cov(w_sum, w_diff)
-            # var(w2) = var(w_sum + w_diff) = var(w_sum) + var(w_diff) + 2*cov(w_sum, w_diff)
-            var_w1 = var_w_sum + var_w_diff - 2 * cov_sum_diff
-            var_w2 = var_w_sum + var_w_diff + 2 * cov_sum_diff
-            
-            # Convert to frequency standard deviations in mHz
-            std_f1.append(np.sqrt(max(0, var_w1)) / (2 * np.pi) * 1000)
-            std_f2.append(np.sqrt(max(0, var_w2)) / (2 * np.pi) * 1000)
-            std_w_sum.append(np.sqrt(var_w_sum) / (2 * np.pi) * 1000)
-            std_w_diff.append(np.sqrt(var_w_diff) / (2 * np.pi) * 1000)
-        
-        samples = np.arange(len(std_f1))
-        ax3.plot(samples, std_f1, 'b-', linewidth=2, label='f1 uncertainty')
-        ax3.plot(samples, std_f2, 'r-', linewidth=2, label='f2 uncertainty')
-        ax3.plot(samples, std_w_sum, 'g--', linewidth=1.5, alpha=0.7, label='f_avg uncertainty')
-        ax3.plot(samples, std_w_diff, 'm--', linewidth=1.5, alpha=0.7, label='f_diff/2 uncertainty')
-        
-        ax3.set_xlabel('Sample')
-        ax3.set_ylabel('Frequency Uncertainty (mHz)')
-        ax3.set_title('EKF Uncertainty Evolution (Reparameterized State)')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-        ax3.set_yscale('log')
-        
-        # 4. Convergence Comparison (third from top right)
-        ax4 = fig.add_subplot(gs[2, 1:])
-        
-        # Bar chart of final errors
-        labels = [r['label'] for r in results]
-        f1_errors = [(r['f1'] - f1_true) * 1000 for r in results]
-        f2_errors = [(r['f2'] - f2_true) * 1000 for r in results]
-        beat_errors = [(r['beat'] - (f2_true - f1_true)) * 1000 for r in results]
-        
-        x = np.arange(len(labels))
-        width = 0.25
-        
-        ax4.bar(x - width, f1_errors, width, label='f1 error', alpha=0.8)
-        ax4.bar(x, f2_errors, width, label='f2 error', alpha=0.8)
-        ax4.bar(x + width, beat_errors, width, label='beat error', alpha=0.8)
-        
-        ax4.set_xlabel('Initialization')
-        ax4.set_ylabel('Error (mHz)')
-        ax4.set_title('Final Estimation Errors')
-        ax4.set_xticks(x)
-        ax4.set_xticklabels(labels, rotation=45, ha='right')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3, axis='y')
-        ax4.axhline(0, color='black', linewidth=0.6)
-        
-        # 5. Signal Reconstruction (bottom right)
-        ax5 = fig.add_subplot(gs[3, 1:])
-        
-        # Use the "Truth" initialization case
-        history = truth_result['history']
-        
-        # Reconstruct signals at a few time points
-        t = np.arange(len(signal_data)) / self.fs
-        time_points = [0, len(signal_data)//4, len(signal_data)//2, -1]
-        
-        for i, tp in enumerate(time_points):
-            alpha = 0.3 + 0.7 * i / len(time_points)
-            if tp == -1:
-                label = 'Final'
-            else:
-                label = f'Sample {tp}'
-                
-            # Reconstruct
-            s1 = history['A1'][tp] * np.exp(1j * 2 * np.pi * history['freq1'][tp] * t)
-            s2 = history['A2'][tp] * np.exp(1j * 2 * np.pi * history['freq2'][tp] * t)
-            reconstruction = s1 + s2
-            
-            if tp == -1:
-                ax5.plot(t[:100], np.real(reconstruction[:100]), 'k-', 
-                        linewidth=1.5, alpha=alpha, label=label)
-            else:
-                ax5.plot(t[:100], np.real(reconstruction[:100]), '-', 
-                        linewidth=1, alpha=alpha, label=label)
-        
-        ax5.plot(t[:100], np.real(signal_data[:100]), 'r--', 
-                linewidth=1.5, alpha=0.8, label='True signal')
-        ax5.set_xlabel('Time (s)')
-        ax5.set_ylabel('Real part')
-        ax5.set_title('Signal Reconstruction Evolution')
-        ax5.legend()
-        ax5.grid(True, alpha=0.3)
-        
-        plt.suptitle('Extended Kalman Filter Analysis (Reparameterized State)', fontsize=16)
-        plt.tight_layout()
-        plt.show()
-        
-        return fig
