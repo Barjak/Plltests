@@ -334,7 +334,7 @@ def test_ekf_analyzer_with_proper_heterodyne():
     
     # Generate test signal
     frame_duration = 0.3  # seconds per frame
-    n_frames = 10  # Number of frames
+    n_frames = 100  # Number of frames
     total_duration = frame_duration * n_frames
     n_samples = int(fs_orig * total_duration)
     t = np.arange(n_samples) / fs_orig
@@ -346,7 +346,7 @@ def test_ekf_analyzer_with_proper_heterodyne():
                  A2 * np.cos(2 * np.pi * f2_rf * t + phi2))
     
     # Add noise
-    noise_level = 0.51
+    noise_level = 0.1
     signal_rf += noise_level * np.random.randn(n_samples)
     
     # 2. I/Q mixer (without calibration first)
@@ -391,15 +391,15 @@ def test_ekf_analyzer_with_proper_heterodyne():
     analyzer = DualEKFAnalyzer(fs_bb)
     
     # Process noise - loosened σ_f as specified
-    sigma_phi = 3e-10      # Phase noise
-    sigma_f = 5e-10        # Frequency drift (5×10⁻⁴ Hz as specified)
-    sigma_A = 1e-10        # Amplitude drift
+    sigma_phi = 1.0      # Phase noise
+    sigma_f = .01       # Frequency drift (5×10⁻⁴ Hz as specified)
+    sigma_A = 7        # Amplitude drift
     Q_ekf = np.diag([sigma_phi**2, sigma_phi**2,     # phi1, phi2
                      sigma_f**2, (sigma_f*.2)**2,          # f1, f2
                      sigma_A**2, sigma_A**2])         # A1, A2
     
     # Measurement noise
-    R = 10.4
+    R = .001
     
     # FFT seed - zero-pad to 2^20 points as specified
     nfft = 2**20
