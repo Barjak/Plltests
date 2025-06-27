@@ -6,7 +6,7 @@ def test_ekf_analyzer_multi_frame():
     fs_baseband = 960.0
     frame_duration = 0.3  # seconds per frame
 
-    n_frames = 25  # Number of frames
+    n_frames = 3  # Number of frames
     total_duration = frame_duration * n_frames
     n_samples = int(fs_baseband * total_duration)
     t = np.arange(n_samples) / fs_baseband
@@ -30,16 +30,16 @@ def test_ekf_analyzer_multi_frame():
     # Set up process and measurement noise covariances for reparameterized state
     # State: [phi1, phi2, w_sum, w_diff, A1, A2]
 
-    sigma_phi = 1e-9      # Phase noise (very small)
-    sigma_w_sum = 1e-9    # Average frequency drift (allow more)
-    sigma_w_diff = 1e-4   # Frequency difference drift (restrict more)
-    sigma_A = 1e-6        # Amplitude drift
+    sigma_phi = 3e-9      # Phase noise (very small)
+    sigma_w_sum = 1e-10    # Average frequency drift (allow more)
+    sigma_w_diff = 3e-4   # Frequency difference drift (restrict more)
+    sigma_A = 1e-10        # Amplitude drift
     Q = np.diag([sigma_phi**2, sigma_phi**2,     # phi1, phi2
                  sigma_w_sum**2, sigma_w_diff**2,  # w_sum, w_diff
                  sigma_A**2, sigma_A**2])          # A1, A2
     
     # Measurement noise
-    R = 3.0
+    R = 0.4
 
     
     # Run from multiple initializations WITH ordering enforcement

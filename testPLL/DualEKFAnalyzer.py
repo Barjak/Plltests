@@ -14,79 +14,65 @@ class DualEKFAnalyzer:
     def dual_ekf_tracking(self, signal_data, f1_init, f2_init, 
                           Q=None, R=None, P0=None,
                           track_amplitude=True,
-                          min_separation_hz=0.003,  # 3 mHz minimum
+                          min_separation_hz=0.006,  # 6 mHz minimum
                           separation_buffer_hz=0.001,  # 1 mHz buffer above minimum
                           acceleration_scale=200.0,  # Scale factor for fast movement when far
-                          transition_zone_hz=0.002,  # 5 mHz transition zone
+                          transition_zone_hz=0.004,  # 4 mHz transition zone
                           damping_factor=3.0,  # Exponential damping strength
                           barrier_decay=4.5,  # Exponential decay for soft barrier
                           barrier_strength=10.0,  # Exponential strength for measurement weight
                           base_separation_weight=0.004):  # Keep for compatibility, ignored
         """
-        Dual-tone tracking using Extended Kalman Filter with reparameterized state,
+        Dual-tone tracking using Extended Kalman Filter with direct frequency parameterization,
         acceleration far from minimum separation, and exponential damping near it
         
-        State vector: x = [phi1, phi2, w_sum, w_diff, A1, A2]
+        State vector: x = [phi1, phi2, f1, f2, A1, A2]
         where:
         - phi1, phi2 = phases
-        - w_sum = (w1 + w2) / 2 (average angular frequency)
-        - w_diff = (w2 - w1) / 2 (half frequency difference)
+        - f1, f2 = frequencies in Hz (with f1 < f2 enforced)
         - A1, A2 = amplitudes
-        
-        This gives: w1 = w_sum - w_diff, w2 = w_sum + w_diff
         """
         n_samples = len(signal_data)
         dt = self.dt
-        min_separation_rad = 2 * np.pi * min_separation_hz
-        min_w_diff = min_separation_rad / 2
-        buffer_rad = 2 * np.pi * separation_buffer_hz
-        transition_zone = 2 * np.pi * transition_zone_hz / 2  # Convert to w_diff units
         
         # Ensure initial ordering
         if f1_init > f2_init:
             f1_init, f2_init = f2_init, f1_init
         
-        # Convert to angular frequencies
-        w1_init = 2 * np.pi * f1_init
-        w2_init = 2 * np.pi * f2_init
-        w_sum_init = (w1_init + w2_init) / 2
-        w_diff_init = (w2_init - w1_init) / 2
-        
         # State transition matrix
-        F = np.array([[1, 0, dt, -dt, 0, 0],  # phi1
-                      [0, 1, dt,  dt, 0, 0],  # phi2
-                      [0, 0,  1,   0, 0, 0],  # w_sum
-                      [0, 0,  0,   1, 0, 0],  # w_diff
-                      [0, 0,  0,   0, 1, 0],  # A1
-                      [0, 0,  0,   0, 0, 1]]) # A2
+        F = np.array([[1, 0, 2*np.pi*dt, 0, 0, 0],  # phi1 += 2*pi*f1*dt
+                      [0, 1, 0, 2*np.pi*dt, 0, 0],  # phi2 += 2*pi*f2*dt
+                      [0, 0, 1, 0, 0, 0],            # f1
+                      [0, 0, 0, 1, 0, 0],            # f2
+                      [0, 0, 0, 0, 1, 0],            # A1
+                      [0, 0, 0, 0, 0, 1]])           # A2
         
         # Initialize state
-        x = np.array([0.0,           # phi1
-                      0.0,           # phi2
-                      w_sum_init,    # w_sum
-                      w_diff_init,   # w_diff
-                      1.0,           # A1
-                      0.7])          # A2
+        x = np.array([0.0,       # phi1
+                      0.0,       # phi2
+                      f1_init,   # f1
+                      f2_init,   # f2
+                      1.0,       # A1
+                      0.7])      # A2
         
         # Base process noise covariance
         if Q is None:
             sigma_phi = 1e-7      # Phase noise (very small)
-            sigma_w_sum = 1e-4    # Average frequency drift (allow more)
-            sigma_w_diff_base = 1e-5   # Base frequency difference drift
+            sigma_f_base = 1e-4   # Base frequency drift
             sigma_A = 1e-6        # Amplitude drift
             Q_base = np.diag([sigma_phi**2, sigma_phi**2, 
-                             sigma_w_sum**2, sigma_w_diff_base**2,
+                             sigma_f_base**2, sigma_f_base**2,
                              sigma_A**2, sigma_A**2])
         else:
             Q_base = Q.copy()
-            sigma_w_diff_base = np.sqrt(Q_base[3, 3])
+            sigma_f_base = np.sqrt(Q_base[2, 2])
         
         # Initial state covariance
         if P0 is None:
             P0 = np.diag([0.1,    # phi1 uncertainty
                           0.1,    # phi2 uncertainty
-                          0.1,    # w_sum uncertainty (rad/s)
-                          0.05,   # w_diff uncertainty (rad/s)
+                          0.05,   # f1 uncertainty (Hz)
+                          0.05,   # f2 uncertainty (Hz)
                           0.01,   # A1 uncertainty
                           0.01])  # A2 uncertainty
         
@@ -108,11 +94,11 @@ class DualEKFAnalyzer:
             'A2': [x[5]],
             'phase1': [x[0]],
             'phase2': [x[1]],
-            'separation': [abs(f2_init - f1_init)],
+            'separation': [f2_init - f1_init],
             'error': [],
             'K': [],
-            'swaps': [],  # Keep for compatibility, always False now
-            'adaptive_Q_w_diff': [],  # Track adaptive process noise
+            'swaps': [],
+            'adaptive_Q': [],  # Track adaptive process noise
             'pseudo_weight': []  # Track adaptive measurement weight
         }
         
@@ -121,21 +107,28 @@ class DualEKFAnalyzer:
             # ---- Adaptive Process Noise ----
             Q = Q_base.copy()
             
-            if x[3] > min_w_diff + transition_zone:
+            # Current separation
+            separation = x[3] - x[2]
+            
+            if separation > min_separation_hz + transition_zone_hz:
                 # Far from barrier: scale UP process noise to allow fast movement
+                Q[2, 2] = Q_base[2, 2] * acceleration_scale
                 Q[3, 3] = Q_base[3, 3] * acceleration_scale
             else:
                 # Near barrier: exponential velocity damping
                 # Distance from minimum (normalized by buffer size)
-                distance_from_min = max(0, x[3] - min_w_diff)
-                relative_distance = distance_from_min / buffer_rad
+                distance_from_min = max(0, separation - min_separation_hz)
+                relative_distance = distance_from_min / separation_buffer_hz
                 
                 # Exponential damping: approaches 0 as we get close to minimum
-                # Adding small constant to avoid division by zero
                 damping = np.exp(-damping_factor * (1 / (relative_distance + 0.1)))
-                Q[3, 3] = Q_base[3, 3] * damping
+                
+                # Apply stronger damping to the frequency that would reduce separation
+                # For f1: damping upward movement, for f2: damping downward movement
+                Q[2, 2] = Q_base[2, 2] * damping  # f1: reduce upward drift
+                Q[3, 3] = Q_base[3, 3] * damping  # f2: reduce downward drift
             
-            history['adaptive_Q_w_diff'].append(np.sqrt(Q[3, 3]))
+            history['adaptive_Q'].append([np.sqrt(Q[2, 2]), np.sqrt(Q[3, 3])])
             
             # ---- Predict ----
             x = F @ x
@@ -146,7 +139,7 @@ class DualEKFAnalyzer:
             x[1] = np.angle(np.exp(1j * x[1]))
             
             # ---- Measurement prediction ----
-            phi1, phi2, w_sum, w_diff = x[0], x[1], x[2], x[3]
+            phi1, phi2, f1, f2 = x[0], x[1], x[2], x[3]
             A1, A2 = x[4], x[5]
             
             # Complex measurement prediction
@@ -163,7 +156,7 @@ class DualEKFAnalyzer:
             H[0, 1] = -A2 * np.sin(phi2)  # dRe/dphi2
             H[1, 1] = A2 * np.cos(phi2)   # dIm/dphi2
             
-            # Derivatives w.r.t w_sum, w_diff are zero for instantaneous measurement
+            # Derivatives w.r.t f1, f2 are zero for instantaneous measurement
             
             if track_amplitude:
                 # Derivatives w.r.t A1
@@ -188,32 +181,36 @@ class DualEKFAnalyzer:
             P = (np.eye(6) - K @ H) @ P
             
             # ---- Soft barrier pseudo-measurement for minimum separation ----
+            current_sep = x[3] - x[2]
+            
             # Only apply if getting close to or below minimum
-            if x[3] < min_w_diff + 3 * buffer_rad:
-                # Soft exponential barrier
-                if x[3] >= min_w_diff:
+            if current_sep < min_separation_hz + 3 * separation_buffer_hz:
+                # Target separation with soft exponential barrier
+                if current_sep >= min_separation_hz:
                     # Above minimum: create soft repulsion
-                    target_w_diff = min_w_diff + buffer_rad * (1 - np.exp(-barrier_decay * (x[3] - min_w_diff) / buffer_rad))
+                    target_sep = min_separation_hz + separation_buffer_hz * (1 - np.exp(-barrier_decay * (current_sep - min_separation_hz) / separation_buffer_hz))
                 else:
                     # Below minimum: strong push back
-                    target_w_diff = min_w_diff + buffer_rad
+                    target_sep = min_separation_hz + separation_buffer_hz
                 
                 # Adaptive measurement weight (exponentially stronger as we approach boundary)
-                if x[3] < min_w_diff:
+                if current_sep < min_separation_hz:
                     # Very strong weight if below minimum
                     weight = base_separation_weight * 100
                 else:
-                    relative_closeness = max(0, (min_w_diff + buffer_rad - x[3]) / buffer_rad)
+                    relative_closeness = max(0, (min_separation_hz + separation_buffer_hz - current_sep) / separation_buffer_hz)
                     weight = base_separation_weight * np.exp(barrier_strength * relative_closeness)
                 
                 history['pseudo_weight'].append(weight)
                 
-                # Pseudo-measurement update
+                # Pseudo-measurement update on the separation f2 - f1
+                # H_pseudo = [0, 0, -1, 1, 0, 0] to observe f2 - f1
                 H_pseudo = np.zeros((1, 6))
-                H_pseudo[0, 3] = 1  # Observe w_diff directly
+                H_pseudo[0, 2] = -1  # df1
+                H_pseudo[0, 3] = 1   # df2
                 
-                z_pseudo = np.array([target_w_diff])
-                z_hat_pseudo = np.array([x[3]])
+                z_pseudo = np.array([target_sep])
+                z_hat_pseudo = np.array([current_sep])
                 
                 R_pseudo = 1.0 / weight
                 
@@ -222,6 +219,12 @@ class DualEKFAnalyzer:
                 
                 x = x + K_pseudo.flatten() * (z_pseudo - z_hat_pseudo)
                 P = (np.eye(6) - np.outer(K_pseudo, H_pseudo)) @ P
+                
+                # Ensure ordering is maintained (f1 < f2)
+                if x[2] > x[3]:
+                    x[2], x[3] = x[3], x[2]
+                    x[0], x[1] = x[1], x[0]
+                    x[4], x[5] = x[5], x[4]
             else:
                 history['pseudo_weight'].append(0.0)
             
@@ -230,25 +233,21 @@ class DualEKFAnalyzer:
                 x[4] = max(0.1, x[4])
                 x[5] = max(0.1, x[5])
             
-            # ---- Convert back to individual frequencies for storage ----
-            w1 = x[2] - x[3]  # w_sum - w_diff
-            w2 = x[2] + x[3]  # w_sum + w_diff
-            
             # ---- Store results ----
             history['x'].append(x.copy())
             history['P'].append(P.copy())
             history['y_pred'].append(y_hat)
             history['innov'].append(innov)
-            history['freq1'].append(w1 / (2 * np.pi))  # Convert to Hz
-            history['freq2'].append(w2 / (2 * np.pi))  # Convert to Hz
+            history['freq1'].append(x[2])
+            history['freq2'].append(x[3])
             history['A1'].append(x[4])
             history['A2'].append(x[5])
             history['phase1'].append(x[0])
             history['phase2'].append(x[1])
-            history['separation'].append(2 * x[3] / (2 * np.pi))  # 2*w_diff = w2-w1
+            history['separation'].append(x[3] - x[2])
             history['error'].append(np.abs(y - y_hat))
             history['K'].append(K.copy())
-            history['swaps'].append(False)  # No swaps with this parameterization
+            history['swaps'].append(False)
         
         # Convert lists to arrays
         for key in history:
@@ -268,7 +267,7 @@ class DualEKFAnalyzer:
             'A1': converged_A1,
             'A2': converged_A2,
             'history': history,
-            'total_swaps': 0  # Always 0 with this parameterization
+            'total_swaps': 0
         }
         
     def run_from_multiple_initializations(self, signal_data, f1_true, f2_true, 
@@ -285,7 +284,7 @@ class DualEKFAnalyzer:
             (f1_true, f1_true + 0.020, "Far apart"),
             (f1_true - 0.005, f2_true + 0.005, "Symmetric offset"),
             (f1_true + 0.002, f2_true - 0.002, "Inward offset"),
-            (5.5, 5.7, "Random far"),
+#             (6.5, 6.7, "Random far"),
         ]
         
         results = []
@@ -300,7 +299,7 @@ class DualEKFAnalyzer:
     
     def compute_error_landscape(self, signal_data, f1_range, f2_range, true_f1, true_f2):
         """Compute the error landscape for visualization"""
-        n_points = 70
+        n_points = 100
         f1_grid = np.linspace(f1_range[0], f1_range[1], n_points)
         f2_grid = np.linspace(f2_range[0], f2_range[1], n_points)
         
@@ -328,8 +327,8 @@ class DualEKFAnalyzer:
                 assert np.abs(f2_check - f2) < 1e-10
                 
                 # Compute error for this (f1, f2) pair
-                s1 = np.exp(1j * 2 * np.pi * f2 * t)
-                s2 = 0.7 * np.exp(1j * 2 * np.pi * f1 * t)
+                s1 = np.exp(1j * 2 * np.pi * f1 * t)
+                s2 = 0.7 * np.exp(1j * 2 * np.pi * f2 * t)
                 estimate = s1 + s2
                 
                 error = np.mean(np.abs(signal_data - estimate)**2)
@@ -349,13 +348,15 @@ class DualEKFAnalyzer:
         # Compute and plot error landscape
         f1_range = (f1_true - 0.015, f1_true + 0.015)
         f2_range = (f2_true - 0.015, f2_true + 0.015)
+#         f1_range = (5.6, 6.8)# 
+#         f2_range = (5.6, 6.8)
         f1_grid, f2_grid, error_landscape = self.compute_error_landscape(
             signal_data, f1_range, f2_range, f1_true, f2_true
         )
         
         # Plot error landscape with more contour lines
         contour = ax1.contourf(f1_grid, f2_grid, np.log10(error_landscape + 1e-10), 
-                               levels=40, cmap='viridis', alpha=0.6)
+                               levels=50, cmap='viridis', alpha=0.6)
         
         # Plot trajectories
         colors = cm.rainbow(np.linspace(0, 1, len(results)))
