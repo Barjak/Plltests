@@ -62,14 +62,14 @@ def design_anti_alias_filter(fs_orig: float, fs_bb: float, passband: float, atte
     fp = min(passband, 0.8 * fs_bb / 2) / nyquist
     
     # Stopband starts at final Nyquist frequency
-    fs = (fs_bb / 2) / nyquist
+    fs_stop = (fs_bb / 2) / nyquist
     
-    # Ensure valid band edges
-    if fp >= fs:
-        fs = min(0.99, fp * 1.2)
+    # Ensure valid band edges  
+    if fp >= fs_stop:
+        fs_stop = min(0.99, fp * 1.2)
     
     # Estimate filter order using Kaiser's formula
-    delta_f = fs - fp
+    delta_f = fs_stop - fp
     delta_p = 10 ** (-atten_dB / 20)  # Passband ripple same as stopband
     
     # Kaiser's approximation
@@ -83,11 +83,11 @@ def design_anti_alias_filter(fs_orig: float, fs_bb: float, passband: float, atte
     N = N + (N % 2)  # Make even
     
     # Design using Parks-McClellan
-    bands = [0, fp, fs, 1]
+    bands = [0, fp/2, fs_stop/2, 0.5]
     desired = [1, 0]
     weights = [1, 10]  # Weight stopband more heavily
     
-    b = signal.remez(N + 1, bands, desired, weights, Hz=2)
+    b = signal.remez(N + 1, bands, desired, weight=weights)
     a = np.array([1.0])
     
     return b, a
@@ -142,7 +142,7 @@ def decimate(x: np.ndarray, decimation_factor: int, b: np.ndarray, a: np.ndarray
 
 
 class ToneRLS:
-    """Recursive Least Squares tracker for multiple tones using EDA-LMS."""
+    """Recursive Least Squares tracker for multiple tones with frequency estimation."""
     
     def __init__(self, M: int, fs: float, T_mem: float):
         """
@@ -158,97 +158,119 @@ class ToneRLS:
         self.T_mem = T_mem
         self.dt = 1.0 / fs
         
-        # EDA-LMS parameters
-        self.alpha = 0.95#np.exp(-self.dt / T_mem)
+        # Forgetting factor
+        self.lambda_forget = np.exp(-self.dt / T_mem)
         
-        # State: complex amplitudes and frequencies for each tone
-        # Parameters: [A1*exp(j*phi1), A2*exp(j*phi2), ..., omega1, omega2, ...]
-        self.theta = np.zeros(2 * M, dtype=complex)
+        # State: [Re(A1), Im(A1), ..., Re(AM), Im(AM), f1, f2, ..., fM]
+        # Using real representation for easier Jacobian computation
+        self.theta = np.zeros(3 * M)
         
-        # Initialize with random frequencies and small amplitudes
+        # Initialize with random values
         for k in range(M):
-            self.theta[k] = 0.1 * np.exp(1j * np.random.uniform(0, 2*np.pi))  # Complex amplitude
-            self.theta[M + k] = np.random.uniform(-10, 10)  # Frequency offset in Hz
+            # Complex amplitude A_k = Re + j*Im
+            amplitude = 0.1
+            phase = np.random.uniform(0, 2*np.pi)
+            self.theta[2*k] = amplitude * np.cos(phase)      # Real part
+            self.theta[2*k + 1] = amplitude * np.sin(phase)  # Imag part
+            # Frequency
+            self.theta[2*M + k] = np.random.uniform(-10, 10)
+        
+        # Extended RLS covariance matrix
+        self.P = np.eye(3 * M) * 1000
         
         # Sample counter
         self.n = 0
         
-        # Regularization parameters
-        self.lambda_reg = 1e-5  # Regularization weight
-        self.beta_sep = 5000    # Separation sharpness
+        # Regularization for frequency separation
+        self.lambda_reg = 1e-5
+        self.beta_sep = 5000
         
-        # For error covariance estimation
-        self.N_eff = int(T_mem * fs)
-        self.recent_phi = []
-        self.recent_weights = []
+        # Error variance
         self.sigma2_est = 1.0
         
     def init_from_bulk(self, x: np.ndarray):
-        """
-        Optional: bootstrap theta, P from a batch (ESPRIT/NLS).
-        
-        Args:
-            x: Complex baseband signal array
-        """
-        # Placeholder - would implement ESPRIT or similar here
-        # For now, keep random initialization
+        """Optional: bootstrap from batch."""
         pass
     
     def update(self, i: float, q: float) -> None:
         """
-        One-sample RLS update given I/Q sample pair.
+        Extended RLS update for amplitude, phase, and frequency.
         
         Args:
             i: In-phase sample
             q: Quadrature sample
         """
-        # Form complex sample
-        x = i + 1j * q
-        
-        # Build regressor vector
-        phi = np.zeros(self.M, dtype=complex)
+        M = self.M
+        x_real = i
+        x_imag = q
         t = self.n * self.dt
         
+        # Compute prediction and Jacobian
+        y_pred_real = 0
+        y_pred_imag = 0
+        
+        # Jacobian matrix (derivatives w.r.t. parameters)
+        H = np.zeros((2, 3 * self.M))  # 2 rows for real/imag parts
+        
         for k in range(self.M):
-            omega_k = self.theta[self.M + k].real  # Frequency in Hz
-            phi[k] = np.exp(1j * 2 * np.pi * omega_k * t)
-        
-        # Prediction using current parameters
-        y_pred = np.sum(self.theta[:self.M] * phi)
-        
-        # Prediction error
-        e = x - y_pred
-        
-        # Adaptive step size (approximating RLS)
-        mu = (1 - self.alpha) / (np.sum(np.abs(phi)**2) + 1e-10)
-        
-        # Update complex amplitudes
-        self.theta[:self.M] += mu * phi.conj() * e
-        
-        # Update frequencies with gradient descent
-        for k in range(self.M):
-            # Gradient of prediction w.r.t. omega_k
-            dphi_domega = 1j * 2 * np.pi * t * phi[k]
-            grad = -2 * np.real(e.conj() * self.theta[k] * dphi_domega)
+            # Extract parameters for tone k
+            a_real = self.theta[2*k]
+            a_imag = self.theta[2*k + 1]
+            freq = self.theta[2*M + k]
             
-            # Add regularization gradient to enforce separation
+            # Basis functions
+            phase = 2 * np.pi * freq * t
+            cos_phase = np.cos(phase)
+            sin_phase = np.sin(phase)
+            
+            # Prediction contribution
+            y_pred_real += a_real * cos_phase - a_imag * sin_phase
+            y_pred_imag += a_real * sin_phase + a_imag * cos_phase
+            
+            # Jacobian w.r.t. complex amplitude (linear part)
+            H[0, 2*k] = cos_phase      # d(y_real)/d(a_real)
+            H[0, 2*k + 1] = -sin_phase  # d(y_real)/d(a_imag)
+            H[1, 2*k] = sin_phase       # d(y_imag)/d(a_real)
+            H[1, 2*k + 1] = cos_phase   # d(y_imag)/d(a_imag)
+            
+            # Jacobian w.r.t. frequency (nonlinear part)
+            d_phase = 2 * np.pi * t
+            H[0, 2*M + k] = d_phase * (-a_real * sin_phase - a_imag * cos_phase)
+            H[1, 2*M + k] = d_phase * (a_real * cos_phase - a_imag * sin_phase)
+        
+        # Innovation (prediction error)
+        e = np.array([x_real - y_pred_real, x_imag - y_pred_imag])
+        
+        # Extended RLS gain
+        S = H @ self.P @ H.T + self.lambda_forget * np.eye(2)
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        # Update parameters
+        self.theta += K @ e
+        
+        # Add frequency separation regularization
+        for k in range(self.M):
+            reg_grad = 0
             for ell in range(self.M):
                 if ell != k:
-                    f_diff = self.theta[self.M + k].real - self.theta[self.M + ell].real
-                    reg_grad = self.lambda_reg * self.beta_sep * np.sign(f_diff) * np.exp(-self.beta_sep * abs(f_diff))
-                    grad -= mu * reg_grad
-            
-            # Update frequency
-            self.theta[self.M + k] -= mu * grad * 0.1  # Scale down frequency updates for stability
+                    f_diff = self.theta[2*M + k] - self.theta[2*M + ell]
+                    reg_grad += self.lambda_reg * self.beta_sep * np.sign(f_diff) * np.exp(-self.beta_sep * abs(f_diff))
+            self.theta[2*M + k] -= 0.001 * reg_grad  # Small step for regularization
         
-        # Store regressor and weight for covariance estimation
-        self.recent_phi.append(phi)
-        self.recent_weights.append(self.alpha ** (self.n))
+        # Update covariance matrix
+        self.P = (self.P - K @ H @ self.P) / self.lambda_forget
+        Q = np.zeros((3*self.M, 3*self.M))
         
-        # Keep only recent history
-        if len(self.recent_phi) > self.N_eff:
-            self.recent_phi.pop(0)
-            self.recent_weights.pop(0)
+        
+        df = 1  # degrees of freedom (lower = heavier tails)
+        chi2 = np.random.chisquare(df)
+        q_freq = 0.1 * df / chi2
+        
+        Q[2*self.M:, 2*self.M:] = np.eye(self.M) * q_freq
+        self.P += Q
+        
+        # Update error variance estimate
+        self.sigma2_est = self.lambda_forget * self.sigma2_est + (1 - self.lambda_forget) * np.dot(e, e)
         
         self.n += 1
     
@@ -261,15 +283,21 @@ class ToneRLS:
                 - amplitudes: Array of tone amplitudes
                 - phases: Array of tone phases (radians)
                 - freqs: Array of tone frequencies (Hz)
-                - cov: Placeholder for covariance matrix diagonal
+                - cov: Covariance matrix diagonal
         """
-        amplitudes = np.abs(self.theta[:self.M])
-        phases = np.angle(self.theta[:self.M])
-        freqs = self.theta[self.M:].real
+        amplitudes = np.zeros(self.M)
+        phases = np.zeros(self.M)
+        freqs = np.zeros(self.M)
         
-        # Placeholder for covariance - would compute from Fisher Information
-        # For now, return small fixed values
-        cov = np.ones(2 * self.M) * 0.01
+        for k in range(self.M):
+            a_real = self.theta[2*k]
+            a_imag = self.theta[2*k + 1]
+            amplitudes[k] = np.sqrt(a_real**2 + a_imag**2)
+            phases[k] = np.arctan2(a_imag, a_real)
+            freqs[k] = self.theta[2*self.M + k]
+        
+        # Extract relevant diagonal elements from covariance
+        cov = np.diag(self.P) * self.sigma2_est
         
         return {
             'amplitudes': amplitudes,
