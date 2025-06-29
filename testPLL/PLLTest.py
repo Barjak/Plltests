@@ -12,7 +12,7 @@ from signal_tracker_lib import (
     decimate,
     ToneRLS
 )
-
+from preprocess import (RingBuffer, StreamingPreprocessor)
 
     
 def compute_error_landscape(signal_data, fs, f1_range, f2_range, f1_true, f2_true, n_points=30, return_colormap=False):
@@ -147,14 +147,31 @@ def visualize_rls_analysis(results, signal_data, fs, f1_true, f2_true,
     plt.tight_layout()
     return fig
 
-def run_tracker_with_history(signal_data, fs, M, T_mem, label, f1_init=None, f2_init=None):
-    """Run tracker and collect detailed history."""
-    tracker = ToneRLS(M, fs, T_mem)
+# Application code
+def run_tracker_streaming(signal_rf, fs_orig, fs_bb, f_center, b_lpf, a_lpf, 
+                         M, T_mem, label, f1_init=None, f2_init=None):
+    """Run tracker with streaming preprocessor and ring buffer."""
+    
+    # Initialize preprocessor
+    preprocessor = StreamingPreprocessor(fs_orig, fs_bb, f_center, b_lpf, a_lpf)
+    
+    # Initialize ring buffer for 2.5 seconds of baseband samples
+    ring_buffer_size = int(2.5 * fs_bb)
+    ring_buffer = RingBuffer(ring_buffer_size)
+    
+    # Initialize tracker
+    tracker = ToneRLS(M, fs_bb, T_mem)
     
     # Override initial frequency estimates if provided
     if f1_init is not None and f2_init is not None:
-        tracker.theta[2*M] = f1_init      # Frequencies now start at index 2*M
+        tracker.theta[2*M] = f1_init
         tracker.theta[2*M + 1] = f2_init
+    
+    # Calculate chunk size for 0.1 seconds of baseband samples
+    bb_samples_per_block = int(0.1 * fs_bb)
+    # Calculate corresponding RF samples needed (with some margin for filter transients)
+    Q = int(fs_orig / fs_bb)
+    rf_samples_per_block = bb_samples_per_block * Q + preprocessor.M
     
     # Storage for history
     history = {
@@ -167,21 +184,38 @@ def run_tracker_with_history(signal_data, fs, M, T_mem, label, f1_init=None, f2_
         'phase2': []
     }
     
-    # Process signal sample by sample
-    N = len(signal_data)
-    for n in range(N):
-        tracker.update(np.real(signal_data[n]), np.imag(signal_data[n]))
+    # Process signal in chunks
+    total_rf_samples = len(signal_rf)
+    rf_position = 0
+    
+    while rf_position < total_rf_samples:
+        # Get next chunk of RF samples
+        chunk_end = min(rf_position + rf_samples_per_block, total_rf_samples)
+        rf_chunk = signal_rf[rf_position:chunk_end]
         
-        # Store history every 10 samples to reduce memory
-        if n % 1 == 0:
-            state = tracker.get_state()
-            history['freq1'].append(state['freqs'][0])
-            history['freq2'].append(state['freqs'][1])
-            history['A1'].append(state['amplitudes'][0])
-            history['A2'].append(state['amplitudes'][1])
-            history['separation'].append(abs(state['freqs'][1] - state['freqs'][0]))
-            history['phase1'].append(state['phases'][0])
-            history['phase2'].append(state['phases'][1])
+        # Process through streaming preprocessor
+        bb_chunk = preprocessor.process(rf_chunk)
+        
+        # Add to ring buffer
+        if len(bb_chunk) > 0:
+            ring_buffer.push(bb_chunk)
+            
+            # Process new samples through RLS tracker sample-by-sample
+            for sample in bb_chunk:
+                tracker.update(np.real(sample), np.imag(sample))
+                
+                # Store history periodically
+                if tracker.n % 10 == 0:  # Every 10 samples
+                    state = tracker.get_state()
+                    history['freq1'].append(state['freqs'][0])
+                    history['freq2'].append(state['freqs'][1])
+                    history['A1'].append(state['amplitudes'][0])
+                    history['A2'].append(state['amplitudes'][1])
+                    history['separation'].append(abs(state['freqs'][1] - state['freqs'][0]))
+                    history['phase1'].append(state['phases'][0])
+                    history['phase2'].append(state['phases'][1])
+        
+        rf_position = chunk_end
     
     # Get final state
     final_state = tracker.get_state()
@@ -191,12 +225,13 @@ def run_tracker_with_history(signal_data, fs, M, T_mem, label, f1_init=None, f2_
         'f1': final_state['freqs'][0],
         'f2': final_state['freqs'][1],
         'beat': final_state['freqs'][1] - final_state['freqs'][0],
-        'f1_init': tracker.theta[2*M] if f1_init is None else f1_init,      # Updated index
-        'f2_init': tracker.theta[2*M + 1] if f2_init is None else f2_init,  # Updated index
+        'f1_init': f1_init if f1_init is not None else tracker.theta[2*M],
+        'f2_init': f2_init if f2_init is not None else tracker.theta[2*M + 1],
         'history': {k: np.array(v) for k, v in history.items()}
     }
     
     return result
+
 
 # ═══════════════════════════════════════════════════════════════════
 #                        RF TONE TRACKING SYSTEM
@@ -242,25 +277,16 @@ signal_rf = (A1 * np.cos(2 * np.pi * f1_rf * t + phi1) +
 signal_rf += noise_level * np.random.randn(len(t))
 
 
-# ─────────────────── Baseband Conversion ───────────────────────────
+# ─────────────────── Streaming Processing & Tracking ────────────────
 
 f_center = (f1_rf + f2_rf) / 2
 print(f"Heterodyne LO frequency: {f_center:.3f} Hz")
-i_het, q_het = heterodyne(signal_rf, fs_orig, f_center)
-
-print("Decimating to baseband...")
-i_baseband = decimate(i_het, Q, b_lpf, a_lpf)
-q_baseband = decimate(q_het, Q, b_lpf, a_lpf)
-signal_data = i_baseband + 1j * q_baseband
 
 f1_bb = f1_rf - f_center
 f2_bb = f2_rf - f_center
 print(f"Expected baseband frequencies: {f1_bb:.6f} Hz, {f2_bb:.6f} Hz")
 
-
-# ─────────────────── Tracking Analysis ─────────────────────────────
-
-print("\nRunning tracking with different initializations...")
+print("\nRunning streaming tracker with different initializations...")
 
 M = 2        # Number of tones
 T_mem = 1.0  # Memory duration
@@ -269,24 +295,30 @@ results = []
 
 # Near-truth initialization
 print("1. Near-truth initialization...")
-result = run_tracker_with_history(signal_data, fs_bb, M, T_mem, "Near Truth",
-                                 f1_init=f1_bb + 0.001, f2_init=f2_bb - 0.001)
+result = run_tracker_streaming(signal_rf, fs_orig, fs_bb, f_center, b_lpf, a_lpf,
+                              M, T_mem, "Near Truth",
+                              f1_init=f1_bb + 0.001, f2_init=f2_bb - 0.001)
 results.append(result)
 
 # Wide initialization
 print("2. Wide initialization...")
-result = run_tracker_with_history(signal_data, fs_bb, M, T_mem, "Wide",
-                                 f1_init=f1_bb - 0.1, f2_init=f2_bb + 0.1)
+result = run_tracker_streaming(signal_rf, fs_orig, fs_bb, f_center, b_lpf, a_lpf,
+                              M, T_mem, "Wide",
+                              f1_init=f1_bb - 0.1, f2_init=f2_bb + 0.1)
 results.append(result)
-print("2. Wide initialization...")
-result = run_tracker_with_history(signal_data, fs_bb, M, T_mem, "Wide",
-                                 f1_init=f1_bb - 0.3, f2_init=f2_bb - 0.1)
+
+# Another wide initialization
+print("3. Wide initialization (variant)...")
+result = run_tracker_streaming(signal_rf, fs_orig, fs_bb, f_center, b_lpf, a_lpf,
+                              M, T_mem, "Wide (var)",
+                              f1_init=f1_bb - 0.3, f2_init=f2_bb - 0.1)
 results.append(result)
 
 # Narrow initialization
-print("3. Narrow initialization...")
-result = run_tracker_with_history(signal_data, fs_bb, M, T_mem, "Narrow",
-                                 f1_init=-0.001, f2_init=0.001)
+print("4. Narrow initialization...")
+result = run_tracker_streaming(signal_rf, fs_orig, fs_bb, f_center, b_lpf, a_lpf,
+                              M, T_mem, "Narrow",
+                              f1_init=-0.001, f2_init=0.001)
 results.append(result)
 
 
@@ -300,7 +332,7 @@ for result in results:
     print(f"  Beat: {result['beat']:.6f} Hz (error: {(result['beat']-(f2_bb-f1_bb))*1000:.3f} mHz)")
 
 print("\nGenerating visualization...")
-fig = visualize_rls_analysis(results, signal_data, fs_bb, f1_bb, f2_bb,
+fig = visualize_rls_analysis(results, None, fs_bb, f1_bb, f2_bb,
                             f1_high=f1_rf, f2_high=f2_rf, f_lo=f_center)
-plt.savefig('rls_tracking_analysis.png', dpi=150, bbox_inches='tight')
+plt.savefig('rls_tracking_analysis_streaming.png', dpi=150, bbox_inches='tight')
 plt.show()
