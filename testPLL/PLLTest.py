@@ -13,57 +13,7 @@ from signal_tracker_lib import (
     ToneRLS
 )
 
-def run_tracker_with_history(signal_data, fs, M, T_mem, label, f1_init=None, f2_init=None):
-    """Run tracker and collect detailed history."""
-    tracker = ToneRLS(M, fs, T_mem)
-    
-    # Override initial frequency estimates if provided
-    if f1_init is not None and f2_init is not None:
-        tracker.theta[2*M] = f1_init      # Frequencies now start at index 2*M
-        tracker.theta[2*M + 1] = f2_init
-    
-    # Storage for history
-    history = {
-        'freq1': [],
-        'freq2': [],
-        'A1': [],
-        'A2': [],
-        'separation': [],
-        'phase1': [],
-        'phase2': []
-    }
-    
-    # Process signal sample by sample
-    N = len(signal_data)
-    for n in range(N):
-        tracker.update(np.real(signal_data[n]), np.imag(signal_data[n]))
-        
-        # Store history every 10 samples to reduce memory
-        if n % 1 == 0:
-            state = tracker.get_state()
-            history['freq1'].append(state['freqs'][0])
-            history['freq2'].append(state['freqs'][1])
-            history['A1'].append(state['amplitudes'][0])
-            history['A2'].append(state['amplitudes'][1])
-            history['separation'].append(abs(state['freqs'][1] - state['freqs'][0]))
-            history['phase1'].append(state['phases'][0])
-            history['phase2'].append(state['phases'][1])
-    
-    # Get final state
-    final_state = tracker.get_state()
-    
-    result = {
-        'label': label,
-        'f1': final_state['freqs'][0],
-        'f2': final_state['freqs'][1],
-        'beat': final_state['freqs'][1] - final_state['freqs'][0],
-        'f1_init': tracker.theta[2*M] if f1_init is None else f1_init,      # Updated index
-        'f2_init': tracker.theta[2*M + 1] if f2_init is None else f2_init,  # Updated index
-        'history': {k: np.array(v) for k, v in history.items()}
-    }
-    
-    return result
-    
+
     
 def compute_error_landscape(signal_data, fs, f1_range, f2_range, f1_true, f2_true, n_points=30, return_colormap=False):
     f1_vals = np.linspace(f1_range[0], f1_range[1], n_points)
@@ -196,7 +146,58 @@ def visualize_rls_analysis(results, signal_data, fs, f1_true, f2_true,
     
     plt.tight_layout()
     return fig
+
+def run_tracker_with_history(signal_data, fs, M, T_mem, label, f1_init=None, f2_init=None):
+    """Run tracker and collect detailed history."""
+    tracker = ToneRLS(M, fs, T_mem)
     
+    # Override initial frequency estimates if provided
+    if f1_init is not None and f2_init is not None:
+        tracker.theta[2*M] = f1_init      # Frequencies now start at index 2*M
+        tracker.theta[2*M + 1] = f2_init
+    
+    # Storage for history
+    history = {
+        'freq1': [],
+        'freq2': [],
+        'A1': [],
+        'A2': [],
+        'separation': [],
+        'phase1': [],
+        'phase2': []
+    }
+    
+    # Process signal sample by sample
+    N = len(signal_data)
+    for n in range(N):
+        tracker.update(np.real(signal_data[n]), np.imag(signal_data[n]))
+        
+        # Store history every 10 samples to reduce memory
+        if n % 1 == 0:
+            state = tracker.get_state()
+            history['freq1'].append(state['freqs'][0])
+            history['freq2'].append(state['freqs'][1])
+            history['A1'].append(state['amplitudes'][0])
+            history['A2'].append(state['amplitudes'][1])
+            history['separation'].append(abs(state['freqs'][1] - state['freqs'][0]))
+            history['phase1'].append(state['phases'][0])
+            history['phase2'].append(state['phases'][1])
+    
+    # Get final state
+    final_state = tracker.get_state()
+    
+    result = {
+        'label': label,
+        'f1': final_state['freqs'][0],
+        'f2': final_state['freqs'][1],
+        'beat': final_state['freqs'][1] - final_state['freqs'][0],
+        'f1_init': tracker.theta[2*M] if f1_init is None else f1_init,      # Updated index
+        'f2_init': tracker.theta[2*M + 1] if f2_init is None else f2_init,  # Updated index
+        'history': {k: np.array(v) for k, v in history.items()}
+    }
+    
+    return result
+
 # ═══════════════════════════════════════════════════════════════════
 #                        RF TONE TRACKING SYSTEM
 # ═══════════════════════════════════════════════════════════════════
@@ -262,7 +263,7 @@ print(f"Expected baseband frequencies: {f1_bb:.6f} Hz, {f2_bb:.6f} Hz")
 print("\nRunning tracking with different initializations...")
 
 M = 2        # Number of tones
-T_mem = 10.0  # Memory duration
+T_mem = 1.0  # Memory duration
 
 results = []
 
