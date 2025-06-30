@@ -6,7 +6,9 @@ import matplotlib.gridspec as gridspec
 import matplotlib.cm as cm
 from scipy import signal as scipy_signal
 from signal_tracker_lib import (
-    ToneRLS
+    ToneRLS,
+    ToneLM,
+    ToneMUSIC
 )
 from preprocess import (RingBuffer, StreamingPreprocessor)
 
@@ -192,7 +194,7 @@ def visualize_rls_analysis(results, signal_data, fs, f1_true, f2_true,
     plt.tight_layout()
     return fig
 
-# Application code
+
 def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_dB,
                          M, T_mem, label, f1_init=None, f2_init=None):
     """Run tracker with streaming preprocessor and ring buffer."""
@@ -214,17 +216,29 @@ def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_
     ring_buffer_size = int(2.5 * fs_bb)
     ring_buffer = RingBuffer(ring_buffer_size)
     
-    # Initialize tracker
-    tracker = ToneRLS(M, fs_bb, T_mem)
-    
     # Calculate baseband frequencies
     f1_bb = f1_rf - f_center
     f2_bb = f2_rf - f_center
     
-    # Override initial frequency estimates if provided
+    # Initialize tracker with target frequency if provided
     if f1_init is not None and f2_init is not None:
-        tracker.theta[2*M] = f1_init
-        tracker.theta[2*M + 1] = f2_init
+        # Use average of initial frequencies as target
+        target_freq = (f1_init + f2_init) / 2.0
+    else:
+        # Use average of expected baseband frequencies
+        target_freq = (f1_bb + f2_bb) / 2.0
+    
+    # Determine frequency search range for baseband signal
+    freq_margin = 1.0  # Hz
+    min_search_freq = min(f1_bb, f2_bb, -1.0) - freq_margin
+    max_search_freq = max(f1_bb, f2_bb, 1.0) + freq_margin
+    
+    # Initialize tracker
+    #tracker = ToneLM(M, fs_bb, T_window=2.5, T_update=0.1, target_freq=target_freq)
+    tracker = ToneRLS(M, fs_bb, T_mem)
+    #tracker = ToneMUSIC(M, fs_bb, T_window=2.5, T_update=0.1, 
+    #                   target_freq=target_freq)#,
+    #                   #freq_range=(min_search_freq, max_search_freq))
     
     # Calculate chunk size for 0.1 seconds of baseband samples
     bb_samples_per_block = int(0.1 * fs_bb)
@@ -262,20 +276,22 @@ def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_
             ring_buffer.push(bb_chunk)
             baseband_accumulator.append(bb_chunk)
             
-            # Process new samples through RLS tracker sample-by-sample
+            # Process new samples through tracker sample-by-sample
             for sample in bb_chunk:
                 tracker.update(np.real(sample), np.imag(sample))
                 
                 # Store history periodically
-                if tracker.n % 5 == 0:  # Every 10 samples
+                history_interval = 10  # max(1, int(fs_bb * 0.1))
+                if ring_buffer.total_samples % history_interval == 0:
                     state = tracker.get_state()
-                    history['freq1'].append(state['freqs'][0])
-                    history['freq2'].append(state['freqs'][1])
-                    history['A1'].append(state['amplitudes'][0])
-                    history['A2'].append(state['amplitudes'][1])
-                    history['separation'].append(abs(state['freqs'][1] - state['freqs'][0]))
-                    history['phase1'].append(state['phases'][0])
-                    history['phase2'].append(state['phases'][1])
+                    if M >= 2:
+                        history['freq1'].append(state['freqs'][0])
+                        history['freq2'].append(state['freqs'][1])
+                        history['A1'].append(state['amplitudes'][0])
+                        history['A2'].append(state['amplitudes'][1])
+                        history['separation'].append(abs(state['freqs'][1] - state['freqs'][0]))
+                        history['phase1'].append(state['phases'][0])
+                        history['phase2'].append(state['phases'][1])
         
         rf_position = chunk_end
     
@@ -290,11 +306,11 @@ def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_
     
     result = {
         'label': label,
-        'f1': final_state['freqs'][0],
-        'f2': final_state['freqs'][1],
-        'beat': final_state['freqs'][1] - final_state['freqs'][0],
-        'f1_init': f1_init if f1_init is not None else tracker.theta[2*M],
-        'f2_init': f2_init if f2_init is not None else tracker.theta[2*M + 1],
+        'f1': final_state['freqs'][0] if M >= 1 else 0.0,
+        'f2': final_state['freqs'][1] if M >= 2 else 0.0,
+        'beat': final_state['freqs'][1] - final_state['freqs'][0] if M >= 2 else 0.0,
+        'f1_init': f1_init if f1_init is not None else target_freq,
+        'f2_init': f2_init if f2_init is not None else target_freq,
         'history': {k: np.array(v) for k, v in history.items()},
         'data_full': data_full,
         'data_last_frame': data_last_frame,
@@ -304,7 +320,6 @@ def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_
     }
     
     return result
-
 
 # ═══════════════════════════════════════════════════════════════════
 #                        RF TONE TRACKING SYSTEM
@@ -325,7 +340,7 @@ atten_dB = 60.0
 A1, A2 = 1.0, 1.0
 phi1, phi2 = 0.0, np.pi/4
 noise_level = 0.1
-total_duration = 2.5
+total_duration = 20.5
 
 
 # ─────────────────── Signal Generation ─────────────────────────────
@@ -350,7 +365,7 @@ results = []
 print("\n1. Near-truth initialization...")
 result = run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_dB,
                               M, T_mem, "Near Truth",
-                              f1_init=-0.003 + 0.001, f2_init=0.003 - 0.001)
+                              f1_init=-0.03 + 0.001, f2_init=0.03 - 0.001)
 results.append(result)
 
 # Get baseband frequencies from first result for subsequent initializations
@@ -376,7 +391,7 @@ results.append(result)
 print("\n4. Narrow initialization...")
 result = run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_dB,
                               M, T_mem, "Narrow",
-                              f1_init=-0.001, f2_init=0.001)
+                              f1_init=-0.2, f2_init=0.01)
 results.append(result)
 
 

@@ -8,9 +8,11 @@ class RingBuffer:
         self.buffer = np.zeros(capacity, dtype=complex)
         self.write_pos = 0
         self.size = 0
+        self.total_samples = 0
     
     def push(self, data):
         """Add samples to the ring buffer."""
+        self.total_samples += len(data)
         n = len(data)
         if n >= self.capacity:
             # If data is larger than buffer, just keep the most recent samples
@@ -96,7 +98,7 @@ class StreamingPreprocessor:
         bandwidth = abs(f2 - f1) + 2 * window_margin
         fs_bb_min = 2.5 * bandwidth
         
-        self.Q = max(1, int(np.floor(fs_orig / fs_bb_min /2))) 
+        self.Q = max(1, int(np.floor(fs_orig / fs_bb_min / 2))) 
         self.fs_out = fs_orig / self.Q
         
         # Design anti-alias filter
@@ -201,3 +203,5 @@ class StreamingPreprocessor:
             return np.array(decimated_samples, dtype=complex)
         else:
             return np.array([], dtype=complex)
+
+
