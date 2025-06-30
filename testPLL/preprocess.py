@@ -62,7 +62,7 @@ class RingBuffer:
 class StreamingPreprocessor:
     """
     Streaming preprocessor that converts raw RF samples to complex baseband
-    using proper overlap-save method for filtering and decimation.
+    using continuous filtering and phase-coherent decimation.
     """
     
     def __init__(self, fs_orig, f1, f2, margin_cents=50, atten_dB=60, 
@@ -96,7 +96,7 @@ class StreamingPreprocessor:
         bandwidth = abs(f2 - f1) + 2 * window_margin
         fs_bb_min = 2.5 * bandwidth
         
-        self.Q = max(1, int(np.floor(fs_orig / fs_bb_min)))
+        self.Q = max(1, int(np.floor(fs_orig / fs_bb_min /2))) 
         self.fs_out = fs_orig / self.Q
         
         # Design anti-alias filter
@@ -115,7 +115,7 @@ class StreamingPreprocessor:
         N = int(np.ceil(D / delta_f))
         N = N + (N % 2)  # Make even
         
-        # Parks-McClellan design (corrected band edges)
+        # Parks-McClellan design
         bands = [0, fp, fs_stop, 0.5]
         desired = [1, 0]
         weights = [1, 10]
@@ -125,221 +125,79 @@ class StreamingPreprocessor:
         # Filter length
         self.M = len(self.b_lpf)
         
-        # Transient length in decimated samples
-        self.T_dec = int(np.ceil((self.M - 1) / self.Q))
-        
-        # Minimum samples needed
-        self.min_first_block = (2 * self.T_dec + 1) * self.Q
-        self.min_subsequent_block = max(1, (self.T_dec + 1) * self.Q - (self.M - 1))
-        
         # Phase accumulator for continuous LO
         self.phase_acc = 0.0
         self.omega = 2 * np.pi * self.f_center / fs_orig
         
-        # Complex filter state
+        # Complex filter state - initialize for continuous filtering
         self.zi_complex = signal.lfilter_zi(self.b_lpf, self.a_lpf).astype(complex) * 0
         
-        # Buffers
-        self.input_buffer = np.array([])
-        self.overlap_buffer = np.zeros(self.M - 1)
+        # Startup management
+        self.startup_buffer = np.array([])
+        self.startup_complete = False
         
-        # First block flag
-        self.first_block = True
+        # Decimation tracking
+        self.total_filtered_kept = 0  # Total filter outputs after dropping initial M-1
         
     def process(self, raw_samples):
         """
-        Process a block of raw RF samples using overlap-save method.
+        Process a block of raw RF samples using continuous filtering.
         """
-        # Accumulate input samples
-        self.input_buffer = np.concatenate([self.input_buffer, raw_samples])
+        # Handle startup buffering
+        if not self.startup_complete:
+            # Accumulate samples until we have at least M-1
+            self.startup_buffer = np.concatenate([self.startup_buffer, raw_samples])
+            
+            if len(self.startup_buffer) < self.M - 1:
+                # Not enough samples yet, return empty
+                return np.array([], dtype=complex)
+            
+            # We have enough samples to start processing
+            samples_to_process = self.startup_buffer
+            self.startup_buffer = np.array([])  # Clear buffer
+            self.startup_complete = True
+        else:
+            # Normal processing - process immediately
+            samples_to_process = raw_samples
         
-        # Process in fixed-size blocks
-        output_blocks = []
+        N = len(samples_to_process)
         
-        while True:
-            # Determine block size to process
-            if self.first_block:
-                block_size = self.min_first_block
-            else:
-                block_size = self.min_subsequent_block
-                
-            # Check if we have enough samples
-            if len(self.input_buffer) < block_size:
-                break
-                
-            # Extract exactly block_size samples
-            samples_to_process = self.input_buffer[:block_size]
-            self.input_buffer = self.input_buffer[block_size:]  # Keep remaining samples
-            
-            N = len(samples_to_process)
-            
-            # Prepare input with overlap
-            if self.first_block:
-                extended_block = samples_to_process
-            else:
-                extended_block = np.concatenate([self.overlap_buffer, samples_to_process])
-                
-            # IMPORTANT: Use actual length of extended_block
-            extended_N = len(extended_block)
-            
-            # Save overlap for next block
-            if N >= self.M - 1:
-                self.overlap_buffer = samples_to_process[-(self.M - 1):]
-            else:
-                # Handle case where block is smaller than filter length
-                # Shift existing overlap buffer and add new samples
-                self.overlap_buffer = np.concatenate([
-                    self.overlap_buffer[N:],
-                    samples_to_process
-                ])
-            
-            # Complex heterodyning
-            phases = self.phase_acc + self.omega * np.arange(extended_N)
-            complex_lo = np.exp(-1j * phases)
-            baseband = extended_block * complex_lo
-            
-            # Update phase accumulator
-            self.phase_acc = (self.phase_acc + self.omega * extended_N) % (2 * np.pi)
-            
-            # Causal filtering with state preservation
-            baseband_filt, self.zi_complex = signal.lfilter(
-                self.b_lpf, self.a_lpf, baseband, zi=self.zi_complex
-            )
-            
-            # Decimate
-            baseband_dec = baseband_filt[::self.Q]
-            
-            # Remove transients
-            if self.first_block:
-                if len(baseband_dec) > 2 * self.T_dec:
-                    clean = baseband_dec[self.T_dec:-self.T_dec]
-                else:
-                    clean = np.array([], dtype=complex)
-                self.first_block = False
-            else:
-                if len(baseband_dec) > self.T_dec:
-                    clean = baseband_dec[self.T_dec:]
-                else:
-                    clean = np.array([], dtype=complex)
-                    
-            output_blocks.append(clean)
+        # Complex heterodyning with continuous phase
+        phases = self.phase_acc + self.omega * np.arange(N)
+        complex_lo = np.exp(-1j * phases)
+        baseband = samples_to_process * complex_lo
         
-        # Concatenate all output blocks
-        if output_blocks:
-            return np.concatenate(output_blocks)
+        # Update phase accumulator
+        self.phase_acc = (self.phase_acc + self.omega * N) % (2 * np.pi)
+        
+        # Continuous filtering with state preservation
+        baseband_filt, self.zi_complex = signal.lfilter(
+            self.b_lpf, self.a_lpf, baseband, zi=self.zi_complex
+        )
+        
+        # Handle startup transient removal (only once)
+        if not self.startup_complete:
+            # This should not happen as we set startup_complete=True above,
+            # but keeping for clarity
+            pass
+        elif self.total_filtered_kept == 0 and len(baseband_filt) >= self.M - 1:
+            # First time processing after startup - drop first M-1 samples
+            baseband_filt = baseband_filt[self.M - 1:]
+        
+        # Phase-coherent decimation
+        decimated_samples = []
+        
+        # Find indices in the current filtered block that align with decimation grid
+        for i in range(len(baseband_filt)):
+            global_filtered_index = self.total_filtered_kept + i
+            if global_filtered_index % self.Q == 0:
+                decimated_samples.append(baseband_filt[i])
+        
+        # Update total filtered samples counter
+        self.total_filtered_kept += len(baseband_filt)
+        
+        # Return decimated output
+        if decimated_samples:
+            return np.array(decimated_samples, dtype=complex)
         else:
             return np.array([], dtype=complex)
-    
-
-# Application code
-def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_dB,
-                         M, T_mem, label, f1_init=None, f2_init=None):
-    """Run tracker with streaming preprocessor and ring buffer."""
-    
-    # Initialize preprocessor with automatic parameter calculation
-    preprocessor = StreamingPreprocessor(fs_orig, f1_rf, f2_rf, 
-                                       margin_cents=margin_cents, 
-                                       atten_dB=atten_dB,
-                                       passband_ratio=0.8)
-    
-    # Get derived parameters from preprocessor
-    fs_bb = preprocessor.fs_out
-    f_center = preprocessor.f_center
-    Q = preprocessor.Q
-    
-    print(f"  Preprocessor params: Q={Q}, fs_bb={fs_bb:.1f} Hz, f_center={f_center:.3f} Hz")
-    
-    # Initialize ring buffer for 2.5 seconds of baseband samples
-    ring_buffer_size = int(2.5 * fs_bb)
-    ring_buffer = RingBuffer(ring_buffer_size)
-    
-    # Initialize tracker
-    tracker = ToneRLS(M, fs_bb, T_mem)
-    
-    # Calculate baseband frequencies
-    f1_bb = f1_rf - f_center
-    f2_bb = f2_rf - f_center
-    
-    # Override initial frequency estimates if provided
-    if f1_init is not None and f2_init is not None:
-        tracker.theta[2*M] = f1_init
-        tracker.theta[2*M + 1] = f2_init
-    
-    # Calculate chunk size for 0.1 seconds of baseband samples
-    bb_samples_per_block = int(0.1 * fs_bb)
-    # Calculate corresponding RF samples needed (with some margin for filter transients)
-    rf_samples_per_block = bb_samples_per_block * Q + preprocessor.M
-    
-    # Storage for history
-    history = {
-        'freq1': [],
-        'freq2': [],
-        'A1': [],
-        'A2': [],
-        'separation': [],
-        'phase1': [],
-        'phase2': []
-    }
-    
-    # Accumulator for complete baseband signal
-    baseband_accumulator = []
-    
-    # Process signal in chunks
-    total_rf_samples = len(signal_rf)
-    rf_position = 0
-    
-    while rf_position < total_rf_samples:
-        # Get next chunk of RF samples
-        chunk_end = min(rf_position + rf_samples_per_block, total_rf_samples)
-        rf_chunk = signal_rf[rf_position:chunk_end]
-        
-        # Process through streaming preprocessor
-        bb_chunk = preprocessor.process(rf_chunk)
-        
-        # Add to ring buffer and accumulator
-        if len(bb_chunk) > 0:
-            ring_buffer.push(bb_chunk)
-            baseband_accumulator.append(bb_chunk)
-            
-            # Process new samples through RLS tracker sample-by-sample
-            for sample in bb_chunk:
-                tracker.update(np.real(sample), np.imag(sample))
-                
-                # Store history periodically
-                if tracker.n % 10 == 0:  # Every 10 samples
-                    state = tracker.get_state()
-                    history['freq1'].append(state['freqs'][0])
-                    history['freq2'].append(state['freqs'][1])
-                    history['A1'].append(state['amplitudes'][0])
-                    history['A2'].append(state['amplitudes'][1])
-                    history['separation'].append(abs(state['freqs'][1] - state['freqs'][0]))
-                    history['phase1'].append(state['phases'][0])
-                    history['phase2'].append(state['phases'][1])
-        
-        rf_position = chunk_end
-    
-    # Get final state
-    final_state = tracker.get_state()
-    
-    # Concatenate all baseband chunks
-    data_full = np.concatenate(baseband_accumulator) if baseband_accumulator else np.array([], dtype=complex)
-    
-    # Get last 2.5 seconds from ring buffer
-    data_last_frame = ring_buffer.get_all()
-    
-    result = {
-        'label': label,
-        'f1': final_state['freqs'][0],
-        'f2': final_state['freqs'][1],
-        'beat': final_state['freqs'][1] - final_state['freqs'][0],
-        'f1_init': f1_init if f1_init is not None else tracker.theta[2*M],
-        'f2_init': f2_init if f2_init is not None else tracker.theta[2*M + 1],
-        'history': {k: np.array(v) for k, v in history.items()},
-        'data_full': data_full,
-        'data_last_frame': data_last_frame,
-        'f1_bb': f1_bb,
-        'f2_bb': f2_bb,
-        'fs_bb': fs_bb
-    }
-    
-    return result

@@ -54,7 +54,7 @@ class ToneRLS:
     def init_from_bulk(self, x: np.ndarray):
         """Optional: bootstrap from batch."""
         pass
-    
+
     def update(self, i: float, q: float) -> None:
         """
         Extended RLS update for amplitude, phase, and frequency.
@@ -124,12 +124,12 @@ class ToneRLS:
         self.P = (self.P - K @ H @ self.P) / self.lambda_forget
         Q = np.zeros((3*self.M, 3*self.M))
         
+        # Keep for testing
+        #df = 9  # degrees of freedom (lower = heavier tails)
+        #chi2 = np.random.chisquare(df)
+        #q_freq = 0.01 * df / chi2
         
-        df = 1  # degrees of freedom (lower = heavier tails)
-        chi2 = np.random.chisquare(df)
-        q_freq = 0.1 * df / chi2
-        
-        Q[2*self.M:, 2*self.M:] = np.eye(self.M) * q_freq
+        Q[2*self.M:, 2*self.M:] = np.eye(self.M) # * q_freq
         self.P += Q
         
         # Update error variance estimate
@@ -140,18 +140,20 @@ class ToneRLS:
     def get_state(self) -> Dict[str, Any]:
         """
         Return amplitudes, phases, frequencies, and error covariances.
+        Results are sorted by frequency in ascending order.
         
         Returns:
             Dictionary with:
-                - amplitudes: Array of tone amplitudes
-                - phases: Array of tone phases (radians)
-                - freqs: Array of tone frequencies (Hz)
-                - cov: Covariance matrix diagonal
+                - amplitudes: Array of tone amplitudes (sorted by frequency)
+                - phases: Array of tone phases in radians (sorted by frequency)
+                - freqs: Array of tone frequencies in Hz (sorted)
+                - cov: Covariance matrix diagonal (reordered to match sorting)
         """
         amplitudes = np.zeros(self.M)
         phases = np.zeros(self.M)
         freqs = np.zeros(self.M)
         
+        # First extract all parameters
         for k in range(self.M):
             a_real = self.theta[2*k]
             a_imag = self.theta[2*k + 1]
@@ -159,14 +161,24 @@ class ToneRLS:
             phases[k] = np.arctan2(a_imag, a_real)
             freqs[k] = self.theta[2*self.M + k]
         
-        # Extract relevant diagonal elements from covariance
-        cov = np.diag(self.P) * self.sigma2_est
+        # Get sorting indices based on frequency
+        sort_idx = np.argsort(freqs)
+        
+        # Extract and reorder covariance diagonal
+        cov_full = np.diag(self.P) * self.sigma2_est
+        cov_reordered = np.zeros(3 * self.M)
+        
+        # Reorder covariance to match sorted frequencies
+        for new_idx, old_idx in enumerate(sort_idx):
+            # Amplitude covariances (real and imaginary parts)
+            cov_reordered[2*new_idx] = cov_full[2*old_idx]
+            cov_reordered[2*new_idx + 1] = cov_full[2*old_idx + 1]
+            # Frequency covariances
+            cov_reordered[2*self.M + new_idx] = cov_full[2*self.M + old_idx]
         
         return {
-            'amplitudes': amplitudes,
-            'phases': phases,
-            'freqs': freqs,
-            'cov': cov
+            'amplitudes': amplitudes[sort_idx],
+            'phases': phases[sort_idx],
+            'freqs': freqs[sort_idx],
+            'cov': cov_reordered
         }
-        
-        

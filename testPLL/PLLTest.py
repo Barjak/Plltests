@@ -64,8 +64,9 @@ def visualize_rls_analysis(results, signal_data, fs, f1_true, f2_true,
     
     # 1. 2D Phase Space
     ax1 = fig.add_subplot(gs[:, 0])
-    f1_range = (f1_true - 0.015, f1_true + 0.015)
-    f2_range = (f2_true - 0.015, f2_true + 0.015)
+    # Fixed range around 0.0
+    f1_range = (-0.015, 0.015)
+    f2_range = (-0.015, 0.015)
     
     if signal_data is not None and len(signal_data) > 0:
         f1_grid, f2_grid, error_landscape, U, V = compute_error_landscape(
@@ -83,15 +84,21 @@ def visualize_rls_analysis(results, signal_data, fs, f1_true, f2_true,
         ax1.plot(history['freq1'][-1], history['freq2'][-1], 's', color=color, markersize=12)
     
     ax1.plot(f1_true, f2_true, '*', color='red', markersize=25)
-    diag_line = np.array([min(f1_range[0], f2_range[0]), max(f1_range[1], f2_range[1])])
+    
+    # Diagonal lines constrained to the fixed range
+    diag_line = np.array([-0.015, 0.015])
     ax1.plot(diag_line, diag_line, 'k--')
     ax1.plot(diag_line, diag_line + 0.003, 'k:')
+    
+    # Set fixed axis limits
+    ax1.set_xlim(-0.015, 0.015)
+    ax1.set_ylim(-0.015, 0.015)
+    
     ax1.set_xlabel('f1 (Hz)')
     ax1.set_ylabel('f2 (Hz)')
     ax1.set_title('2D Frequency Space Trajectories')
     ax1.grid(True)
     ax1.set_aspect('equal')
-    
     # 2. Power Spectrum
     ax2 = fig.add_subplot(gs[0, 1:])
     
@@ -260,7 +267,7 @@ def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_
                 tracker.update(np.real(sample), np.imag(sample))
                 
                 # Store history periodically
-                if tracker.n % 10 == 0:  # Every 10 samples
+                if tracker.n % 5 == 0:  # Every 10 samples
                     state = tracker.get_state()
                     history['freq1'].append(state['freqs'][0])
                     history['freq2'].append(state['freqs'][1])
@@ -317,7 +324,7 @@ atten_dB = 60.0
 # Signal Properties
 A1, A2 = 1.0, 1.0
 phi1, phi2 = 0.0, np.pi/4
-noise_level = 0.0
+noise_level = 0.1
 total_duration = 2.5
 
 
@@ -335,7 +342,7 @@ signal_rf += noise_level * np.random.randn(len(t))
 print("\nRunning streaming tracker with different initializations...")
 
 M = 2        # Number of tones
-T_mem = 1.0  # Memory duration
+T_mem = 10.0  # Memory duration
 
 results = []
 
