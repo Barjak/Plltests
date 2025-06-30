@@ -220,26 +220,23 @@ def run_tracker_streaming(signal_rf, fs_orig, f1_rf, f2_rf, margin_cents, atten_
     f1_bb = f1_rf - f_center
     f2_bb = f2_rf - f_center
     
-    # Initialize tracker with target frequency if provided
-    if f1_init is not None and f2_init is not None:
-        # Use average of initial frequencies as target
-        target_freq = (f1_init + f2_init) / 2.0
-    else:
-        # Use average of expected baseband frequencies
-        target_freq = (f1_bb + f2_bb) / 2.0
-    
     # Determine frequency search range for baseband signal
     freq_margin = 1.0  # Hz
     min_search_freq = min(f1_bb, f2_bb, -1.0) - freq_margin
     max_search_freq = max(f1_bb, f2_bb, 1.0) + freq_margin
     
     # Initialize tracker
-    #tracker = ToneLM(M, fs_bb, T_window=2.5, T_update=0.1, target_freq=target_freq)
     tracker = ToneRLS(M, fs_bb, T_mem)
-    #tracker = ToneMUSIC(M, fs_bb, T_window=2.5, T_update=0.1, 
-    #                   target_freq=target_freq)#,
-    #                   #freq_range=(min_search_freq, max_search_freq))
     
+    # Calculate baseband frequencies
+    f1_bb = f1_rf - f_center
+    f2_bb = f2_rf - f_center
+    
+    # Override initial frequency estimates if provided
+    if f1_init is not None and f2_init is not None:
+        tracker.theta[2*M] = f1_init
+        tracker.theta[2*M + 1] = f2_init
+
     # Calculate chunk size for 0.1 seconds of baseband samples
     bb_samples_per_block = int(0.1 * fs_bb)
     # Calculate corresponding RF samples needed (with some margin for filter transients)
@@ -340,7 +337,7 @@ atten_dB = 60.0
 A1, A2 = 1.0, 1.0
 phi1, phi2 = 0.0, np.pi/4
 noise_level = 0.1
-total_duration = 20.5
+total_duration = 2.5
 
 
 # ─────────────────── Signal Generation ─────────────────────────────
