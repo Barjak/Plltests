@@ -7,16 +7,26 @@ from scipy.linalg import eigh
 from numpy.lib.stride_tricks import sliding_window_view
 
 class ToneRLS:
-    """Recursive Least Squares tracker for multiple tones with frequency estimation."""
+    """Recursive Least Squares tracker for multiple tones with frequency estimation and velocity tracking."""
     
-    def __init__(self, M: int, fs: float, T_mem: float):
+    def __init__(self, M: int, fs: float, T_mem: float, 
+                 beta_smooth: float = 0.5,
+                 lambda_reg: float = 1e-5,
+                 beta_sep: float = 5000,
+                 sigma2_init: float = 1e0,
+                 q_freq_vel: float = 1e2):
         """
         Initialize RLS tracker.
-        
+        [1.25e+03, 9.71e-02, 3.12e+06, 3.04e+03, 3.51e+08, 6.39e+02]
         Args:
             M: Number of sinusoids to track
             fs: Baseband sample rate (Hz)
             T_mem: Memory time constant (seconds)
+            beta_smooth: Smoothing factor for frequency updates (0-1, default: 0.5)
+            lambda_reg: Regularization strength for frequency separation (default: 1e-5)
+            beta_sep: Separation penalty steepness (default: 5000)
+            sigma2_init: Initial error variance estimate (default: 1e0)
+            q_freq_vel: Process noise for frequency velocity (default: 1e2)
         """
         self.M = M
         self.fs = fs
@@ -26,40 +36,53 @@ class ToneRLS:
         # Forgetting factor
         self.lambda_forget = np.exp(-self.dt / T_mem)
         
-        # State: [Re(A1), Im(A1), ..., Re(AM), Im(AM), f1, f2, ..., fM]
-        # Using real representation for easier Jacobian computation
-        self.theta = np.zeros(3 * M)
+        # State: [Re(A1), Im(A1), ..., Re(AM), Im(AM), f1, ..., fM, f1_dot, ..., fM_dot]
+        # Size: 2*M + M + M = 4*M
+        self.theta = np.zeros(4 * M)
         
+        self.beta_smooth = beta_smooth
+        self.deltatheta_smooth = np.zeros_like(self.theta)
+
         # Initialize with random values
         for k in range(M):
             # Complex amplitude A_k = Re + j*Im
-            amplitude = 0.1
+            amplitude = 0.5
             phase = np.random.uniform(0, 2*np.pi)
             self.theta[2*k] = amplitude * np.cos(phase)      # Real part
             self.theta[2*k + 1] = amplitude * np.sin(phase)  # Imag part
             # Frequency
             self.theta[2*M + k] = np.random.uniform(-10, 10)
-        
+            # Frequency derivative (initialized to 0)
+            self.theta[3*M + k] = 0.0
+            
         # Extended RLS covariance matrix
-        self.P = np.eye(3 * M) * 1000
+        self.P = np.eye(4 * M) * 1000
         
         # Sample counter
         self.n = 0
         
         # Regularization for frequency separation
-        self.lambda_reg = 1e-5
-        self.beta_sep = 5000
+        self.lambda_reg = lambda_reg
+        self.beta_sep = beta_sep
         
         # Error variance
-        self.sigma2_est = 1.0
+        self.sigma2_est = sigma2_init
         
-    def init_from_bulk(self, x: np.ndarray):
-        """Optional: bootstrap from batch."""
-        pass
-
+        # Process noise parameters
+        self.q_freq_vel = q_freq_vel
+        
+    def predict_state(self):
+        """Predict next state using dynamics model."""
+        # State transition: frequencies evolve according to their velocities
+        for k in range(self.M):
+            # f(t+1) = f(t) + f_dot(t) * dt
+            self.theta[2*self.M + k] += self.theta[3*self.M + k] * self.dt
+            # f_dot(t+1) = f_dot(t) (constant velocity model)
+            # No change to amplitude states
+            
     def update(self, i: float, q: float) -> None:
         """
-        Extended RLS update for amplitude, phase, and frequency.
+        Extended RLS update for amplitude, phase, frequency, and frequency velocity.
         
         Args:
             i: In-phase sample
@@ -70,18 +93,31 @@ class ToneRLS:
         x_imag = q
         t = self.n * self.dt
         
-        # Compute prediction and Jacobian
+        # State prediction step
+        self.predict_state()
+        
+        # State transition matrix F (4M x 4M)
+        F = np.eye(4 * M)
+        for k in range(M):
+            # f(t+1) = f(t) + f_dot(t) * dt
+            F[2*M + k, 3*M + k] = self.dt
+        
+        # Predict covariance
+        self.P = F @ self.P @ F.T
+        
+        # Compute measurement prediction and Jacobian
         y_pred_real = 0
         y_pred_imag = 0
         
         # Jacobian matrix (derivatives w.r.t. parameters)
-        H = np.zeros((2, 3 * self.M))  # 2 rows for real/imag parts
+        H = np.zeros((2, 4 * self.M))  # 2 rows for real/imag measurements
         
         for k in range(self.M):
             # Extract parameters for tone k
             a_real = self.theta[2*k]
             a_imag = self.theta[2*k + 1]
             freq = self.theta[2*M + k]
+            # freq_dot = self.theta[3*M + k]  # Not directly used in measurement
             
             # Basis functions
             phase = 2 * np.pi * freq * t
@@ -92,16 +128,20 @@ class ToneRLS:
             y_pred_real += a_real * cos_phase - a_imag * sin_phase
             y_pred_imag += a_real * sin_phase + a_imag * cos_phase
             
-            # Jacobian w.r.t. complex amplitude (linear part)
+            # Jacobian w.r.t. complex amplitude
             H[0, 2*k] = cos_phase      # d(y_real)/d(a_real)
             H[0, 2*k + 1] = -sin_phase  # d(y_real)/d(a_imag)
             H[1, 2*k] = sin_phase       # d(y_imag)/d(a_real)
             H[1, 2*k + 1] = cos_phase   # d(y_imag)/d(a_imag)
             
-            # Jacobian w.r.t. frequency (nonlinear part)
+            # Jacobian w.r.t. frequency
             d_phase = 2 * np.pi * t
             H[0, 2*M + k] = d_phase * (-a_real * sin_phase - a_imag * cos_phase)
             H[1, 2*M + k] = d_phase * (a_real * cos_phase - a_imag * sin_phase)
+            
+            # Jacobian w.r.t. frequency derivative is 0 (no direct measurement dependence)
+            H[0, 3*M + k] = 0
+            H[1, 3*M + k] = 0
         
         # Innovation (prediction error)
         e = np.array([x_real - y_pred_real, x_imag - y_pred_imag])
@@ -111,27 +151,36 @@ class ToneRLS:
         K = self.P @ H.T @ np.linalg.inv(S)
         
         # Update parameters
-        self.theta += K @ e
+        dtheta = K @ e
+        
+        # Update amplitudes directly
+        self.theta[:2*M] += dtheta[:2*M]
+        
+        # Update frequencies with smoothing
+        f_idx = slice(2*M, 3*M)
+        old_f = self.theta[f_idx].copy()
+        self.theta[f_idx] += (1 - self.beta_smooth) * dtheta[f_idx]
+        
+        # Update frequency velocities
+        f_dot_idx = slice(3*M, 4*M)
+        self.theta[f_dot_idx] += dtheta[f_dot_idx]
         
         # Add frequency separation regularization
-        for k in range(self.M):
+        for k in range(M):
             reg_grad = 0
-            for ell in range(self.M):
+            for ell in range(M):
                 if ell != k:
                     f_diff = self.theta[2*M + k] - self.theta[2*M + ell]
                     reg_grad += self.lambda_reg * self.beta_sep * np.sign(f_diff) * np.exp(-self.beta_sep * abs(f_diff))
-            self.theta[2*M + k] -= 0.001 * reg_grad  # Small step for regularization
+            self.theta[2*M + k] -= 0.001 * reg_grad
         
         # Update covariance matrix
         self.P = (self.P - K @ H @ self.P) / self.lambda_forget
-        Q = np.zeros((3*self.M, 3*self.M))
         
-        # Keep for testing
-        #df = 9  # degrees of freedom (lower = heavier tails)
-        #chi2 = np.random.chisquare(df)
-        #q_freq = 0.01 * df / chi2
-        
-        Q[2*self.M:, 2*self.M:] = np.eye(self.M) # * q_freq
+        # Process noise matrix Q
+        Q = np.zeros((4*M, 4*M))
+        # Add process noise to frequency velocities
+        Q[3*M:, 3*M:] = np.eye(M) * self.q_freq_vel
         self.P += Q
         
         # Update error variance estimate
@@ -141,7 +190,7 @@ class ToneRLS:
     
     def get_state(self) -> Dict[str, Any]:
         """
-        Return amplitudes, phases, frequencies, and error covariances.
+        Return amplitudes, phases, frequencies, frequency velocities, and error covariances.
         Results are sorted by frequency in ascending order.
         
         Returns:
@@ -149,11 +198,13 @@ class ToneRLS:
                 - amplitudes: Array of tone amplitudes (sorted by frequency)
                 - phases: Array of tone phases in radians (sorted by frequency)
                 - freqs: Array of tone frequencies in Hz (sorted)
+                - freq_dots: Array of frequency derivatives in Hz/s (sorted)
                 - cov: Covariance matrix diagonal (reordered to match sorting)
         """
         amplitudes = np.zeros(self.M)
         phases = np.zeros(self.M)
         freqs = np.zeros(self.M)
+        freq_dots = np.zeros(self.M)
         
         # First extract all parameters
         for k in range(self.M):
@@ -162,13 +213,14 @@ class ToneRLS:
             amplitudes[k] = np.sqrt(a_real**2 + a_imag**2)
             phases[k] = np.arctan2(a_imag, a_real)
             freqs[k] = self.theta[2*self.M + k]
+            freq_dots[k] = self.theta[3*self.M + k]
         
         # Get sorting indices based on frequency
         sort_idx = np.argsort(freqs)
         
         # Extract and reorder covariance diagonal
         cov_full = np.diag(self.P) * self.sigma2_est
-        cov_reordered = np.zeros(3 * self.M)
+        cov_reordered = np.zeros(4 * self.M)
         
         # Reorder covariance to match sorted frequencies
         for new_idx, old_idx in enumerate(sort_idx):
@@ -177,15 +229,16 @@ class ToneRLS:
             cov_reordered[2*new_idx + 1] = cov_full[2*old_idx + 1]
             # Frequency covariances
             cov_reordered[2*self.M + new_idx] = cov_full[2*self.M + old_idx]
+            # Frequency derivative covariances
+            cov_reordered[3*self.M + new_idx] = cov_full[3*self.M + old_idx]
         
         return {
             'amplitudes': amplitudes[sort_idx],
             'phases': phases[sort_idx],
             'freqs': freqs[sort_idx],
+            'freq_dots': freq_dots[sort_idx],
             'cov': cov_reordered
         }
-
-
 
 class ToneLM:
     """Block-based Levenberg-Marquardt tracker for multiple tones."""
@@ -194,7 +247,7 @@ class ToneLM:
                  target_freq: Optional[float] = None):
         """
         Initialize LM tracker.
-        
+        [6.5, 5.3e-1, 3.0e-2, 1e6, 4e4, 5.9e5]
         Args:
             M: Number of sinusoids to track
             fs: Baseband sample rate (Hz)
