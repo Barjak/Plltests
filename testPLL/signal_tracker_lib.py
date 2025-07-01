@@ -10,14 +10,15 @@ class ToneRLS:
     """Recursive Least Squares tracker for multiple tones with frequency estimation and velocity tracking."""
     
     def __init__(self, M: int, fs: float, T_mem: float, 
-                 beta_smooth: float = 0.5,
-                 lambda_reg: float = 1e-5,
-                 beta_sep: float = 5000,
-                 sigma2_init: float = 1e0,
-                 q_freq_vel: float = 1e2):
+                 beta_smooth: float = 9.71e-02,
+                 lambda_reg: float = 312e+03,
+                 beta_sep: float = 3.04e+03,
+                 sigma2_init: float = 3.51e+08,
+                 q_freq_vel: float = 6.39e+02):
         """
         Initialize RLS tracker.
         [1.25e+03, 9.71e-02, 3.12e+06, 3.04e+03, 3.51e+08, 6.39e+02]
+        [5.45e+03, 1.79e-01, 8.60e+04, 9.24e-03, 2.83e+03, 3.49e+03]
         Args:
             M: Number of sinusoids to track
             fs: Baseband sample rate (Hz)
@@ -239,6 +240,247 @@ class ToneRLS:
             'freq_dots': freq_dots[sort_idx],
             'cov': cov_reordered
         }
+class ToneEKF:
+    """Extended Kalman Filter for dual-tone tracking with minimum separation enforcement."""
+    
+    def __init__(self, M: int, fs: float, T_mem: float, 
+                 min_separation_hz: float = 0.008,
+                 separation_buffer_hz: float = 0.001,
+                 separation_weight: float = 10.1):
+        """
+        Initialize dual-tone EKF tracker (backwards compatible with RLS interface).
+        
+        Args:
+            M: Number of sinusoids (must be 2)
+            fs: Baseband sample rate (Hz)
+            T_mem: Memory time constant (seconds) - for RLS compatibility
+            min_separation_hz: Minimum allowed frequency separation (default 6 mHz)
+            separation_buffer_hz: Buffer above minimum separation (default 1 mHz)
+            separation_weight: Weight for pseudo-measurement (default 0.01)
+        """
+        assert M == 2, "DualToneEKF only supports M=2"
+        self.M = M
+        self.fs = fs
+        self.T_mem = T_mem
+        self.dt = 1.0 / fs
+        
+        # Pseudo-measurement parameters
+        self.min_separation_hz = min_separation_hz
+        self.separation_buffer_hz = separation_buffer_hz
+        self.separation_weight = separation_weight
+        self.target_separation = min_separation_hz + separation_buffer_hz
+        
+        # State: [phi1, phi2, f1, f2, A1, A2]
+        self.x = np.array([0.0, 0.0, -5.0, 5.0, 1.0, 1.0])  # Default frequencies at ±5 Hz
+        
+        # State transition matrix
+        self.F = np.array([[1, 0, 2*np.pi*self.dt, 0, 0, 0],
+                          [0, 1, 0, 2*np.pi*self.dt, 0, 0],
+                          [0, 0, 1, 0, 0, 0],
+                          [0, 0, 0, 1, 0, 0],
+                          [0, 0, 0, 0, 1, 0],
+                          [0, 0, 0, 0, 0, 1]])
+        
+        # Process noise covariance
+        sigma_phi = 1e-7
+        sigma_f = 1e-4
+        sigma_A = 1e-6
+        self.Q = np.diag([sigma_phi**2, sigma_phi**2, 
+                         sigma_f**2, sigma_f**2,
+                         sigma_A**2, sigma_A**2])
+        
+        # RLS-style memory-based Q scaling (commented out)
+        # lambda_forget = np.exp(-self.dt / T_mem)
+        # scale_factor = (1 - lambda_forget) / lambda_forget
+        # self.Q *= scale_factor
+        
+        # State covariance
+        self.P = np.diag([0.1, 0.1, 0.05, 0.05, 0.01, 0.01])
+        
+        # Measurem
+#        ent noise covariance
+        self.R = 0.01
+        
+        # Sample counter
+        self.n = 0
+    
+    def init_from_bulk(self, x: np.ndarray):
+        """Optional: bootstrap from batch (for compatibility)."""
+        pass
+    
+    def update(self, i: float, q: float) -> None:
+        """
+        EKF update for dual-tone tracking.
+        
+        Args:
+            i: In-phase sample
+            q: Quadrature sample
+        """
+        # Complex measurement
+        y = i + 1j * q
+        
+        # ---- Predict ----
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        
+        # Wrap phases to [-pi, pi]
+        self.x[0] = np.angle(np.exp(1j * self.x[0]))
+        self.x[1] = np.angle(np.exp(1j * self.x[1]))
+        
+        # ---- Measurement Update ----
+        phi1, phi2, f1, f2 = self.x[0], self.x[1], self.x[2], self.x[3]
+        A1, A2 = self.x[4], self.x[5]
+        
+        # Complex measurement prediction
+        y_hat = A1 * np.exp(1j * phi1) + A2 * np.exp(1j * phi2)
+        
+        # Jacobian H
+        H = np.zeros((2, 6))
+        
+        # Derivatives w.r.t phi1
+        H[0, 0] = -A1 * np.sin(phi1)  # dRe/dphi1
+        H[1, 0] = A1 * np.cos(phi1)   # dIm/dphi1
+        
+        # Derivatives w.r.t phi2
+        H[0, 1] = -A2 * np.sin(phi2)  # dRe/dphi2
+        H[1, 1] = A2 * np.cos(phi2)   # dIm/dphi2
+        
+        # Derivatives w.r.t A1
+        H[0, 4] = np.cos(phi1)  # dRe/dA1
+        H[1, 4] = np.sin(phi1)  # dIm/dA1
+        
+        # Derivatives w.r.t A2
+        H[0, 5] = np.cos(phi2)  # dRe/dA2
+        H[1, 5] = np.sin(phi2)  # dIm/dA2
+        
+        # Innovation
+        z = np.array([np.real(y), np.imag(y)])
+        z_hat = np.array([np.real(y_hat), np.imag(y_hat)])
+        innov = z - z_hat
+        
+        # Kalman gain
+        S = H @ self.P @ H.T + self.R * np.eye(2)
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        # Update
+        self.x = self.x + K @ innov
+        self.P = (np.eye(6) - K @ H) @ self.P
+        
+        # ---- Pseudo-measurement for minimum separation ----
+        current_sep = self.x[3] - self.x[2]
+        
+        if current_sep < self.target_separation:
+            # Pseudo-measurement update on the separation f2 - f1
+            H_pseudo = np.zeros((1, 6))
+            H_pseudo[0, 2] = -1  # df1
+            H_pseudo[0, 3] = 1   # df2
+            
+            z_pseudo = np.array([self.target_separation])
+            z_hat_pseudo = np.array([current_sep])
+            
+            R_pseudo = 1.0 / self.separation_weight
+            
+            S_pseudo = H_pseudo @ self.P @ H_pseudo.T + R_pseudo
+            K_pseudo = self.P @ H_pseudo.T / S_pseudo
+            
+            self.x = self.x + K_pseudo.flatten() * (z_pseudo - z_hat_pseudo)
+            self.P = (np.eye(6) - np.outer(K_pseudo, H_pseudo)) @ self.P
+        
+        # Ensure ordering is maintained (f1 < f2)
+        if self.x[2] > self.x[3]:
+            self.x[2], self.x[3] = self.x[3], self.x[2]
+            self.x[0], self.x[1] = self.x[1], self.x[0]
+            self.x[4], self.x[5] = self.x[5], self.x[4]
+        
+        # Ensure positive amplitudes
+        self.x[4] = max(0.1, self.x[4])
+        self.x[5] = max(0.1, self.x[5])
+        
+        self.n += 1
+    
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Return state in RLS-compatible format.
+        Results are sorted by frequency in ascending order.
+        
+        Returns:
+            Dictionary with:
+                - amplitudes: Array of tone amplitudes
+                - phases: Array of tone phases in radians  
+                - freqs: Array of tone frequencies in Hz
+                - cov: Covariance matrix diagonal (RLS format)
+        """
+        # Extract states (already ordered as f1 < f2)
+        phi1, phi2 = self.x[0], self.x[1]
+        f1, f2 = self.x[2], self.x[3]
+        A1, A2 = self.x[4], self.x[5]
+        
+        # Convert to RLS format
+        amplitudes = np.array([A1, A2])
+        phases = np.array([phi1, phi2])
+        freqs = np.array([f1, f2])
+        
+        # Convert covariance to RLS format
+        # RLS format: [Re(A1), Im(A1), Re(A2), Im(A2), f1, f2]
+        # We need to transform from EKF format: [phi1, phi2, f1, f2, A1, A2]
+        
+        # Jacobian for the transformation
+        J = np.zeros((6, 6))
+        
+        # Re(A1) = A1 * cos(phi1)
+        J[0, 0] = -A1 * np.sin(phi1)  # d/dphi1
+        J[0, 4] = np.cos(phi1)         # d/dA1
+        
+        # Im(A1) = A1 * sin(phi1)
+        J[1, 0] = A1 * np.cos(phi1)   # d/dphi1
+        J[1, 4] = np.sin(phi1)         # d/dA1
+        
+        # Re(A2) = A2 * cos(phi2)
+        J[2, 1] = -A2 * np.sin(phi2)  # d/dphi2
+        J[2, 5] = np.cos(phi2)         # d/dA2
+        
+        # Im(A2) = A2 * sin(phi2)
+        J[3, 1] = A2 * np.cos(phi2)   # d/dphi2
+        J[3, 5] = np.sin(phi2)         # d/dA2
+        
+        # f1, f2 are direct
+        J[4, 2] = 1.0
+        J[5, 3] = 1.0
+        
+        # Transform covariance
+        P_rls = J @ self.P @ J.T
+        cov_diag = np.diag(P_rls)
+        
+        return {
+            'amplitudes': amplitudes,
+            'phases': phases,
+            'freqs': freqs,
+            'cov': cov_diag
+        }
+    
+    def get_state_ekf(self) -> Dict[str, Any]:
+        """
+        Return state in natural EKF format.
+        
+        Returns:
+            Dictionary with:
+                - phi1, phi2: Phases in radians
+                - f1, f2: Frequencies in Hz (f1 < f2)
+                - A1, A2: Amplitudes
+                - P: Full 6x6 covariance matrix
+                - separation: Current frequency separation
+        """
+        return {
+            'phi1': self.x[0],
+            'phi2': self.x[1],
+            'f1': self.x[2],
+            'f2': self.x[3],
+            'A1': self.x[4],
+            'A2': self.x[5],
+            'P': self.P.copy(),
+            'separation': self.x[3] - self.x[2]
+        }
+
 
 class ToneLM:
     """Block-based Levenberg-Marquardt tracker for multiple tones."""
